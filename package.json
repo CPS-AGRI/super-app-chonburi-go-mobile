@@ -1,0 +1,13 @@
+{
+  "name": "super-app-chonburi-go-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "nodemon --watch \"./**/*.go\" --ext go --exec \"go run cmd/server/main.go\"",
+    "start": "go run cmd/server/main.go",
+    "build": "go build -o bin/server.exe cmd/server/main.go"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  }
+}
