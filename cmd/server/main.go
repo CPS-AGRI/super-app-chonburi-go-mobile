@@ -5,6 +5,9 @@ import (
 	"time"
 
 	"super-app-chonburi-go-mobile/config"
+	"super-app-chonburi-go-mobile/internal/delivery/http"
+	"super-app-chonburi-go-mobile/internal/repository"
+	"super-app-chonburi-go-mobile/internal/usecase"
 	"super-app-chonburi-go-mobile/pkg/database"
 
 	"github.com/gofiber/fiber/v3"
@@ -40,8 +43,14 @@ func main() {
 		AllowCredentials: false,
 	}))
 
-	api := app.Group("/api/v1")
-	_ = api // TODO: register routes here
+	// Dependency Injection
+	authRepo := repository.NewAuthRepository(database.DB)
+	authUseCase := usecase.NewAuthUseCase(authRepo, cfg)
+	http.NewAuthHandler(app, authUseCase)
+
+	complaintRepo := repository.NewComplaintRepository(database.DB)
+	complaintUseCase := usecase.NewComplaintUseCase(complaintRepo)
+	http.NewComplaintHandler(app, complaintUseCase)
 
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")

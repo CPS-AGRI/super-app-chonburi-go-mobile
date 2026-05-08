@@ -8,10 +8,15 @@ import (
 )
 
 type Config struct {
-	AppPort    string
-	DBDsn      string
-	OrgName    string
-	OrgLogoURL string
+	AppPort            string
+	DBDsn              string
+	OrgName            string
+	OrgLogoURL         string
+	JWTSecret          string
+	GoogleClientID     string
+	GoogleClientSecret string
+	FacebookAppID      string
+	FacebookAppSecret  string
 }
 
 func LoadConfig() *Config {
@@ -35,10 +40,20 @@ func LoadConfig() *Config {
 		orgName = "องค์การบริหารส่วนจังหวัดชลบุรี"
 	}
 
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = "chonburi-plus-mobile-secret-key-2024"
+	}
+
 	return &Config{
-		AppPort:    port,
-		DBDsn:      dsn,
-		OrgName:    orgName,
-		OrgLogoURL: os.Getenv("ORG_LOGO_URL"),
+		AppPort:            port,
+		DBDsn:              dsn,
+		OrgName:            orgName,
+		OrgLogoURL:         os.Getenv("ORG_LOGO_URL"),
+		JWTSecret:          jwtSecret,
+		GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+		GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+		FacebookAppID:      os.Getenv("FACEBOOK_APP_ID"),
+		FacebookAppSecret:  os.Getenv("FACEBOOK_APP_SECRET"),
 	}
 }

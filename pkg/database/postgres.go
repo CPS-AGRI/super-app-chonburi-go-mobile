@@ -34,8 +34,7 @@ func ConnectDB(cfg *config.Config) {
 
 	DB.Exec("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"")
 
-	// TODO: AutoMigrate domain models here when ready
-	// e.g. DB.AutoMigrate(&domain.User{})
+	// NOTE: No AutoMigrate here. Schema is managed by Admin Backend.
 
 	log.Println("✅ Database connected successfully.")
 }
