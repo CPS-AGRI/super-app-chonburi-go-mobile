@@ -7,7 +7,6 @@ import (
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
 	"super-app-chonburi-go-mobile/pkg/database"
-	"time"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
@@ -72,60 +71,7 @@ func main() {
 		log.Printf("✅ Seeded User: %s", data.Profile.Name)
 	}
 
-	// --- SEED COMPLAINTS ---
-	if firstUserID != "" {
-		complaints := []domain.Complaint{
-			{
-				ID:           uuid.New().String(),
-				UserId:       firstUserID,
-				ModuleTypeId: uuid.New().String(),
-				DocumentId:   "CP-20240508-0001",
-				Title:        "ถนนเป็นหลุมบ่อ",
-				Description:  "ถนนเส้นหน้าหมู่บ้านชลบุรีพลัสเป็นหลุมขนาดใหญ่ เสี่ยงเกิดอุบัติเหตุ",
-				Status:       domain.ComplaintStatusUpdated,
-				CreatedDate:  time.Now().Add(-24 * time.Hour),
-				UpdatedDate:  time.Now(),
-				CreatedBy:    firstUserID,
-				UpdatedBy:    firstUserID,
-			},
-			{
-				ID:           uuid.New().String(),
-				UserId:       firstUserID,
-				ModuleTypeId: uuid.New().String(),
-				DocumentId:   "CP-20240508-0002",
-				Title:        "ไฟถนนดับ",
-				Description:  "ไฟกิ่งซอย 5 ดับทั้งซอย มืดมากครับ",
-				Status:       domain.ComplaintStatusInProgress,
-				CreatedDate:  time.Now().Add(-48 * time.Hour),
-				UpdatedDate:  time.Now().Add(-12 * time.Hour),
-				CreatedBy:    firstUserID,
-				UpdatedBy:    firstUserID,
-			},
-			{
-				ID:           uuid.New().String(),
-				UserId:       firstUserID,
-				ModuleTypeId: uuid.New().String(),
-				DocumentId:   "CP-20240508-0003",
-				Title:        "ขยะตกค้าง",
-				Description:  "ไม่ได้มาเก็บขยะมา 3 วันแล้วครับ ส่งกลิ่นเหม็น",
-				Status:       domain.ComplaintStatusSubmitted,
-				CreatedDate:  time.Now().Add(-2 * time.Hour),
-				UpdatedDate:  time.Now().Add(-2 * time.Hour),
-				CreatedBy:    firstUserID,
-				UpdatedBy:    firstUserID,
-			},
-		}
-
-		for _, c := range complaints {
-			var existing domain.Complaint
-			if err := database.DB.Where("document_id = ?", c.DocumentId).First(&existing).Error; err != nil {
-				database.DB.Create(&c)
-				log.Printf("✅ Seeded Complaint: %s", c.DocumentId)
-			}
-		}
-	}
-
-	log.Println("✨ Seeding completed!")
+	log.Printf("✨ Seeding completed! First User ID for testing: %s\n", firstUserID)
 }
 
 func hashValue(v string) string {

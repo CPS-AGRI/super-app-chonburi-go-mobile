@@ -52,6 +52,10 @@ func main() {
 	complaintUseCase := usecase.NewComplaintUseCase(complaintRepo)
 	http.NewComplaintHandler(app, complaintUseCase)
 
+	moduleRepo := repository.NewModuleRepository(database.DB)
+	moduleUseCase := usecase.NewModuleUseCase(moduleRepo)
+	http.NewModuleHandler(app, moduleUseCase)
+
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")
 	})

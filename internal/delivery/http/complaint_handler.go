@@ -2,6 +2,7 @@ package http
 
 import (
 	"super-app-chonburi-go-mobile/internal/domain"
+	"strconv"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -17,18 +18,25 @@ func NewComplaintHandler(app *fiber.App, useCase domain.ComplaintUseCase) {
 	// TODO: Add Auth Middleware here once created
 	group.Get("/", handler.GetMyComplaints)
 	group.Post("/", handler.AddComplaint)
+	group.Patch("/:id", handler.UpdateComplaint)
 	group.Get("/:id", handler.GetDetail)
-	group.Post("/:id/cancel", handler.CancelComplaint)
+	group.Delete("/:id", handler.CancelComplaint)
 }
 
 func (h *complaintHandler) GetMyComplaints(c fiber.Ctx) error {
-	// Mock User ID for now, will get from JWT middleware later
-	userID := "1a5152bd-d98f-448c-865c-6f74fc47c1ca" 
-	
+	userID, _ := h.useCase.GetFirstUserID() // Simulated user
 	status := c.Query("status")
 	search := c.Query("search")
+	page, err := strconv.Atoi(c.Query("page", "1"))
+	if err != nil || page < 1 {
+		page = 1
+	}
+	limit, err := strconv.Atoi(c.Query("limit", "10"))
+	if err != nil || limit < 1 {
+		limit = 10
+	}
 
-	complaints, err := h.useCase.GetMyComplaints(userID, status, search)
+	complaints, err := h.useCase.GetMyComplaints(userID, status, search, page, limit)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -37,10 +45,12 @@ func (h *complaintHandler) GetMyComplaints(c fiber.Ctx) error {
 }
 
 func (h *complaintHandler) AddComplaint(c fiber.Ctx) error {
-	userID := "1a5152bd-d98f-448c-865c-6f74fc47c1ca" 
+	userID, err := h.useCase.GetFirstUserID()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to get default user: " + err.Error()})
+	}
 
 	var req struct {
-		Title        string   `json:"title"`
 		Description  string   `json:"description"`
 		ModuleTypeId string   `json:"module_type_id"`
 		Latitude     float64  `json:"latitude"`
@@ -55,7 +65,6 @@ func (h *complaintHandler) AddComplaint(c fiber.Ctx) error {
 
 	complaint := &domain.Complaint{
 		UserId:       userID,
-		Title:        req.Title,
 		Description:  req.Description,
 		ModuleTypeId: req.ModuleTypeId,
 		Latitude:     req.Latitude,
@@ -72,8 +81,46 @@ func (h *complaintHandler) AddComplaint(c fiber.Ctx) error {
 	return c.Status(201).JSON(fiber.Map{"data": complaint})
 }
 
+func (h *complaintHandler) UpdateComplaint(c fiber.Ctx) error {
+	userID, err := h.useCase.GetFirstUserID()
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": "Failed to get default user: " + err.Error()})
+	}
+
+	id := c.Params("id")
+
+	var req struct {
+		Description  string   `json:"description"`
+		ModuleTypeId string   `json:"module_type_id"`
+		Latitude     float64  `json:"latitude"`
+		Longitude    float64  `json:"longitude"`
+		Status       string   `json:"status"`
+		Images       []string `json:"images"`
+	}
+
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	complaint := &domain.Complaint{
+		ID:           id,
+		UserId:       userID,
+		Description:  req.Description,
+		ModuleTypeId: req.ModuleTypeId,
+		Latitude:     req.Latitude,
+		Longitude:    req.Longitude,
+		Status:       req.Status,
+	}
+
+	if err := h.useCase.UpdateComplaint(complaint, req.Images); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{"data": complaint})
+}
+
 func (h *complaintHandler) GetDetail(c fiber.Ctx) error {
-	userID := "1a5152bd-d98f-448c-865c-6f74fc47c1ca"
+	userID, _ := h.useCase.GetFirstUserID()
 	id := c.Params("id")
 
 	complaint, err := h.useCase.GetDetail(id, userID)
@@ -85,12 +132,12 @@ func (h *complaintHandler) GetDetail(c fiber.Ctx) error {
 }
 
 func (h *complaintHandler) CancelComplaint(c fiber.Ctx) error {
-	userID := "1a5152bd-d98f-448c-865c-6f74fc47c1ca"
+	userID, _ := h.useCase.GetFirstUserID()
 	id := c.Params("id")
 
-	if err := h.useCase.CancelComplaint(id, userID); err != nil {
+	if err := h.useCase.DeleteComplaint(id, userID); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	return c.JSON(fiber.Map{"message": "complaint canceled successfully"})
+	return c.JSON(fiber.Map{"message": "complaint deleted successfully"})
 }
