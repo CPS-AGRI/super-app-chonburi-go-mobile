@@ -177,7 +177,6 @@ yarn build
 
 ## 📝 Notes
 
-- API path จะ **ไม่ซ้ำ** กับ `super-app-chonburi-go` เนื่องจาก user คนละ group กัน
 - JWT ที่ออกโดย Mobile API **แยกจาก** JWT ของ Admin Backend
 - ใช้ Port `8081` เพื่อให้ run parallel กับ Admin Backend ที่ Port `8080`
 - ตาราง `users` ใหม่ ไม่ใช่ `admin_users` เดิม

@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "nodemon --watch \"./**/*.go\" --ext go --exec \"go run cmd/server/main.go\"",
     "start": "go run cmd/server/main.go",
-    "build": "go build -o bin/server.exe cmd/server/main.go"
+    "build": "go build -o bin/server.exe cmd/server/main.go",
+    "seed": "go run cmd/seed/main.go"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"
