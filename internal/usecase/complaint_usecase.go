@@ -23,9 +23,9 @@ func (u *complaintUseCase) AddComplaint(complaint *domain.Complaint, imageURLs [
 	complaint.CreatedDate = time.Now()
 	complaint.UpdatedDate = time.Now()
 	
-	// Default status if not set
-	if complaint.Status == "" {
-		complaint.Status = domain.ComplaintStatusSubmitted
+	// Default to pending if not draft
+	if complaint.Status != domain.ComplaintStatusDraft {
+		complaint.Status = domain.ComplaintStatusPending
 	}
 
 	// Map Images
