@@ -7,11 +7,11 @@ import (
 // Complaint Statuses based on mockup
 const (
 	ComplaintStatusDraft      = "draft"       // แบบร่าง
-	ComplaintStatusSubmitted  = "submitted"   // ส่งเรื่อง
-	ComplaintStatusUpdated    = "updated"     // อัพเดท
-	ComplaintStatusInProgress = "in_progress" // ดำเนินการ
-	ComplaintStatusCompleted  = "completed"  // เสร็จสมบูรณ์
-	ComplaintStatusCanceled   = "canceled"   // ยกเลิก
+	ComplaintStatusPending    = "pending"     // รับเรื่อง (ส่งเรื่อง)
+	ComplaintStatusReceived   = "received"    // รับเรื่องแล้ว (จ่ายงานกอง)
+	ComplaintStatusInProgress = "in_progress" // กำลังดำเนินการ
+	ComplaintStatusCompleted  = "completed"   // เสร็จสมบูรณ์
+	ComplaintStatusRejected   = "rejected"    // ตีกลับศูนย์
 )
 
 type Complaint struct {
