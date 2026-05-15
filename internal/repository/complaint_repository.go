@@ -22,7 +22,11 @@ func (r *complaintRepository) GetByUserID(userID string, status string, search s
 	query := r.db.Preload("Images").Preload("ModuleType").Preload("Activities.Images").Where("user_id = ?", userID)
 
 	if status != "" && status != "all" {
-		query = query.Where("status = ?", status)
+		if status == "pending" {
+			query = query.Where("status IN ?", []string{"pending", "received", "rejected"})
+		} else {
+			query = query.Where("status = ?", status)
+		}
 	}
 
 	if search != "" {
