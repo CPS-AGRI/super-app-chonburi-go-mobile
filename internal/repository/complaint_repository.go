@@ -22,7 +22,11 @@ func (r *complaintRepository) GetByUserID(userID string, status string, search s
 	query := r.db.Preload("Images").Preload("ModuleType").Preload("Activities.Images").Where("user_id = ?", userID)
 
 	if status != "" && status != "all" {
-		query = query.Where("status = ?", status)
+		if status == "pending" {
+			query = query.Where("status IN ?", []string{"pending", "received", "rejected"})
+		} else {
+			query = query.Where("status = ?", status)
+		}
 	}
 
 	if search != "" {
@@ -58,6 +62,9 @@ func (r *complaintRepository) Update(complaint *domain.Complaint) error {
 			"status":         complaint.Status,
 			"updated_date":   complaint.UpdatedDate,
 			"updated_by":     complaint.UpdatedBy,
+			"assignee_id":    complaint.AssigneeId,
+			"department_id":  complaint.DepartmentId,
+			"is_disputed":    complaint.IsDisputed,
 		}
 
 		if err := tx.Table("module_complaints").Where("id = ?", complaint.ID).Updates(updateData).Error; err != nil {
@@ -119,3 +126,54 @@ func (r *complaintRepository) GetFirstUserID() (string, error) {
 	err := r.db.Table("users").Select("id").Limit(1).Scan(&userID).Error
 	return userID, err
 }
+
+func (r *complaintRepository) CreateActivity(activity *domain.ComplaintActivity) error {
+	return r.db.Create(activity).Error
+}
+
+func (r *complaintRepository) CreateRatingHistory(history *domain.ComplaintRatingHistory) error {
+	return r.db.Create(history).Error
+}
+
+func (r *complaintRepository) GetCompleterInfo(complaintID string) (*string, *string, error) {
+	// 1. Fetch the complaint to check its department_id first
+	var complaint domain.Complaint
+	errComp := r.db.Select("id, assignee_id, department_id").First(&complaint, "id = ?", complaintID).Error
+
+	// 2. Find last completed activity
+	var completedBy string
+	err := r.db.Table("module_complaint_activities").
+		Where("module_complaint_id = ? AND status = ?", complaintID, "completed").
+		Order("created_date DESC").
+		Limit(1).
+		Pluck("created_by", &completedBy).
+		Error
+
+	var assigneeIDPtr *string
+	if err == nil && completedBy != "" {
+		assigneeIDPtr = &completedBy
+	} else if errComp == nil {
+		assigneeIDPtr = complaint.AssigneeId
+	}
+
+	// 3. Determine the department_id
+	var deptIDPtr *string
+	if errComp == nil && complaint.DepartmentId != nil {
+		// [Option 2: Central Mode] Use the department that the complaint was explicitly assigned/forwarded to
+		deptIDPtr = complaint.DepartmentId
+	} else if assigneeIDPtr != nil {
+		// [Option 1: Direct Mode / Fallback] Use the department of the employee who completed the work
+		var deptID string
+		errDept := r.db.Table("admin_departments").
+			Where("admin_id = ?", *assigneeIDPtr).
+			Limit(1).
+			Pluck("department_id", &deptID).
+			Error
+		if errDept == nil && deptID != "" {
+			deptIDPtr = &deptID
+		}
+	}
+
+	return assigneeIDPtr, deptIDPtr, nil
+}
+

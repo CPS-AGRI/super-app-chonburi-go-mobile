@@ -6,13 +6,21 @@ import (
 
 // Complaint Statuses based on mockup
 const (
-	ComplaintStatusDraft      = "draft"       // แบบร่าง
-	ComplaintStatusPending    = "pending"     // รับเรื่อง (ส่งเรื่อง)
-	ComplaintStatusReceived   = "received"    // รับเรื่องแล้ว (จ่ายงานกอง)
-	ComplaintStatusInProgress = "in_progress" // กำลังดำเนินการ
-	ComplaintStatusCompleted  = "completed"   // เสร็จสมบูรณ์
-	ComplaintStatusRejected   = "rejected"    // ตีกลับศูนย์
+	ComplaintStatusDraft      = "draft"
+	ComplaintStatusPending    = "pending"
+	ComplaintStatusReceived   = "received"
+	ComplaintStatusInProgress = "in_progress"
+	ComplaintStatusCompleted  = "completed"
+	ComplaintStatusRejected   = "rejected"
+
+	ActivityStatusUserRating     = "user_rating"
+	ActivityStatusDisputeRequest = "dispute_request"
 )
+
+type ComplaintRating struct {
+	Rating  int    `json:"rating"`
+	Comment string `json:"comment"`
+}
 
 type Complaint struct {
 	ID                string         `gorm:"type:uuid;primaryKey;column:id" json:"id"`
@@ -29,11 +37,17 @@ type Complaint struct {
 	UpdatedBy         string         `gorm:"not null;column:updated_by" json:"updated_by"`
 	DeletedAt         *time.Time     `gorm:"column:deleted_at" json:"deleted_at,omitempty"`
 	DepartmentId      *string        `gorm:"type:uuid;index;column:department_id" json:"department_id"`
+	AssigneeId        *string        `gorm:"type:uuid;index;column:assignee_id" json:"assignee_id"`
+	IsDisputed        bool           `gorm:"not null;default:false;column:is_disputed;index" json:"is_disputed"`
 	
 	// Relations
 	Images     []ComplaintImage    `gorm:"foreignKey:ModuleComplaintId" json:"images,omitempty"`
 	ModuleType *ModuleType         `gorm:"foreignKey:ModuleTypeId" json:"module_type,omitempty"`
 	Activities []ComplaintActivity `gorm:"foreignKey:ModuleComplaintId" json:"activities,omitempty"`
+
+	// Transient fields (computed in usecase)
+	CurrentRating     *ComplaintRating `gorm:"-" json:"current_rating,omitempty"`
+	HasRatedThisRound bool             `gorm:"-" json:"has_rated_this_round"`
 }
 
 func (Complaint) TableName() string { return "module_complaints" }
@@ -81,6 +95,22 @@ type ComplaintActivityImage struct {
 
 func (ComplaintActivityImage) TableName() string { return "module_complaint_activity_images" }
 
+// module_complaint_rating_histories
+type ComplaintRatingHistory struct {
+	ID                string     `gorm:"type:uuid;primaryKey;column:id" json:"id"`
+	ModuleComplaintId string     `gorm:"type:uuid;index;not null;column:module_complaint_id" json:"module_complaint_id"`
+	AssigneeId        *string    `gorm:"type:uuid;index;column:assignee_id" json:"assignee_id"`
+	DepartmentId      *string    `gorm:"type:uuid;index;column:department_id" json:"department_id"`
+	RatingScore       *int       `gorm:"column:rating_score;index" json:"rating_score"`
+	IsDisputed        bool       `gorm:"not null;default:false;column:is_disputed;index" json:"is_disputed"`
+	CreatedDate       time.Time  `gorm:"not null;type:timestamptz;column:created_date;index" json:"created_at"`
+	UpdatedDate       time.Time  `gorm:"not null;type:timestamptz;column:updated_date" json:"updated_at"`
+	CreatedBy         string     `gorm:"not null;column:created_by" json:"created_by"`
+	UpdatedBy         string     `gorm:"not null;column:updated_by" json:"updated_by"`
+}
+
+func (ComplaintRatingHistory) TableName() string { return "module_complaint_rating_histories" }
+
 // Repository & UseCase Interfaces
 type ComplaintRepository interface {
 	Create(complaint *Complaint) error
@@ -90,7 +120,11 @@ type ComplaintRepository interface {
 	UpdateStatus(id string, status string) error
 	Delete(id string) error
 	GetFirstUserID() (string, error)
+	CreateActivity(activity *ComplaintActivity) error
+	CreateRatingHistory(history *ComplaintRatingHistory) error
+	GetCompleterInfo(complaintID string) (*string, *string, error)
 }
+
 
 type ComplaintUseCase interface {
 	AddComplaint(complaint *Complaint, imageURLs []string) error
@@ -99,4 +133,6 @@ type ComplaintUseCase interface {
 	GetDetail(id string, userID string) (*Complaint, error)
 	DeleteComplaint(id string, userID string) error
 	GetFirstUserID() (string, error)
+	RateComplaint(id string, userID string, rating int, comment string) error
+	DisputeComplaint(id string, userID string, reason string) error
 }

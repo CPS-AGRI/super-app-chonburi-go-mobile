@@ -14,13 +14,14 @@ func NewComplaintHandler(app *fiber.App, useCase domain.ComplaintUseCase) {
 	handler := &complaintHandler{useCase: useCase}
 
 	group := app.Group("/api/v1/complaints")
-	
-	// TODO: Add Auth Middleware here once created
+
 	group.Get("/", handler.GetMyComplaints)
 	group.Post("/", handler.AddComplaint)
 	group.Patch("/:id", handler.UpdateComplaint)
 	group.Get("/:id", handler.GetDetail)
 	group.Delete("/:id", handler.CancelComplaint)
+	group.Post("/:id/rate", handler.Rate)
+	group.Post("/:id/dispute", handler.Dispute)
 }
 
 func (h *complaintHandler) GetMyComplaints(c fiber.Ctx) error {
@@ -140,4 +141,42 @@ func (h *complaintHandler) CancelComplaint(c fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"message": "complaint deleted successfully"})
+}
+
+func (h *complaintHandler) Rate(c fiber.Ctx) error {
+	userID, _ := h.useCase.GetFirstUserID()
+	id := c.Params("id")
+
+	var req struct {
+		Rating  int    `json:"rating"`
+		Comment string `json:"comment"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+	}
+	if req.Rating < 1 || req.Rating > 5 {
+		return c.Status(400).JSON(fiber.Map{"error": "rating must be between 1 and 5"})
+	}
+
+	if err := h.useCase.RateComplaint(id, userID, req.Rating, req.Comment); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"message": "rated successfully"})
+}
+
+func (h *complaintHandler) Dispute(c fiber.Ctx) error {
+	userID, _ := h.useCase.GetFirstUserID()
+	id := c.Params("id")
+
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	if err := h.useCase.DisputeComplaint(id, userID, req.Reason); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"message": "dispute submitted successfully"})
 }

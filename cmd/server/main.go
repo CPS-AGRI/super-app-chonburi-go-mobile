@@ -56,6 +56,14 @@ func main() {
 	moduleUseCase := usecase.NewModuleUseCase(moduleRepo)
 	http.NewModuleHandler(app, moduleUseCase)
 
+	taxRepo := repository.NewTaxRepository(database.DB)
+	taxUseCase := usecase.NewTaxUseCase(taxRepo)
+	http.NewTaxHandler(app, taxUseCase)
+
+	muniBankRepo := repository.NewMunicipalityBankRepository(database.DB)
+	muniBankUseCase := usecase.NewMunicipalityBankUseCase(muniBankRepo)
+	http.NewMunicipalityBankHandler(app, muniBankUseCase)
+
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")
 	})
