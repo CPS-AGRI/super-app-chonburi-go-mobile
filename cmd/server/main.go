@@ -64,6 +64,14 @@ func main() {
 	muniBankUseCase := usecase.NewMunicipalityBankUseCase(muniBankRepo)
 	http.NewMunicipalityBankHandler(app, muniBankUseCase)
 
+	publicRelationRepo := repository.NewPublicRelationMobileRepository(database.DB)
+	publicRelationUseCase := usecase.NewPublicRelationMobileUseCase(publicRelationRepo)
+	http.NewPublicRelationMobileHandler(app, publicRelationUseCase)
+
+	notificationRepo := repository.NewNotificationRepository(database.DB)
+	notificationUseCase := usecase.NewNotificationUseCase(notificationRepo)
+	http.NewNotificationHandler(app, notificationUseCase)
+
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")
 	})
