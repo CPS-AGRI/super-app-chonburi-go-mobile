@@ -65,6 +65,7 @@ type UserInformation struct {
 	Status                    string     `gorm:"type:text;not null;default:'active';column:status" json:"status"`
 	VerificationStatus        string     `gorm:"type:text;not null;default:'unverified';column:verification_status" json:"verification_status"`
 	VerifiedDate              *time.Time `gorm:"type:timestamptz;column:verified_date" json:"verified_date"`
+	RejectionReason           *string    `gorm:"type:text;column:rejection_reason" json:"rejection_reason"`
 	
 	// Address Data
 	HouseNumber               string     `gorm:"type:text;not null;default:'';column:house_number" json:"house_number"`

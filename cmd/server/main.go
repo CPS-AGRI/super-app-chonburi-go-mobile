@@ -9,6 +9,8 @@ import (
 	"super-app-chonburi-go-mobile/internal/repository"
 	"super-app-chonburi-go-mobile/internal/usecase"
 	"super-app-chonburi-go-mobile/pkg/database"
+	"super-app-chonburi-go-mobile/pkg/mail"
+	"super-app-chonburi-go-mobile/pkg/storage"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/compress"
@@ -25,6 +27,7 @@ func main() {
 
 	app := fiber.New(fiber.Config{
 		AppName:      "Super App Chonburi Mobile API",
+		BodyLimit:    100 * 1024 * 1024, // 100MB
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
@@ -60,6 +63,13 @@ func main() {
 	taxUseCase := usecase.NewTaxUseCase(taxRepo)
 	http.NewTaxHandler(app, taxUseCase)
 
+	// Tax Self-Declaration (Mobile) — new module
+	mailSender := mail.NewSMTPEmailSender(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPEmail, cfg.SMTPPassword)
+	uploadStorage := storage.NewLocalStorage(cfg.TaxUploadDir, "http://localhost:"+cfg.AppPort+"/uploads")
+	taxNewMobileRepo := repository.NewTaxNewMobileRepository(database.DB)
+	taxNewMobileUseCase := usecase.NewTaxNewMobileUseCase(taxNewMobileRepo, mailSender, cfg.TaxBillerID)
+	http.NewTaxNewMobileHandler(app, taxNewMobileUseCase, uploadStorage)
+
 	muniBankRepo := repository.NewMunicipalityBankRepository(database.DB)
 	muniBankUseCase := usecase.NewMunicipalityBankUseCase(muniBankRepo)
 	http.NewMunicipalityBankHandler(app, muniBankUseCase)
@@ -71,6 +81,10 @@ func main() {
 	notificationRepo := repository.NewNotificationRepository(database.DB)
 	notificationUseCase := usecase.NewNotificationUseCase(notificationRepo)
 	http.NewNotificationHandler(app, notificationUseCase)
+
+	verificationRepo := repository.NewVerificationRepository(database.DB)
+	verificationUseCase := usecase.NewVerificationUseCase(verificationRepo)
+	http.NewVerificationHandler(app, verificationUseCase, cfg)
 
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")

@@ -51,6 +51,7 @@ type NotificationResponseItem struct {
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Date        string `json:"date"`
+	UpdatedDate string `json:"updated_date"`
 	Type        string `json:"type"` // "general", "flood", "tax"
 	Read        bool   `json:"read"`
 }

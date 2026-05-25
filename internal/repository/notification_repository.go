@@ -26,12 +26,13 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 		ReferenceTitle string
 		ReferenceBody  string
 		CreatedDate    time.Time
+		UpdatedDate    time.Time
 		ModuleName     string
 		Read           bool
 	}
 	var txItems []txRow
 	err := r.db.Raw(`
-		SELECT n.id, n.reference_title, n.reference_body, n.created_date, COALESCE(m.name_th, '') as module_name,
+		SELECT n.id, n.reference_title, n.reference_body, n.created_date, n.updated_date, COALESCE(m.name_th, '') as module_name,
 		       (un.module_notification_id IS NOT NULL) as read
 		FROM module_notifications n
 		LEFT JOIN modules m ON m.id = n.module_id
@@ -48,12 +49,13 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 		Title       string
 		Description string
 		CreatedDate time.Time
+		UpdatedDate time.Time
 		ModuleName  string
 		Read        bool
 	}
 	var prItems []prRow
 	err = r.db.Raw(`
-		SELECT p.id, p.title, COALESCE(p.description, '') as description, p.created_date, COALESCE(m.name_th, '') as module_name,
+		SELECT p.id, p.title, COALESCE(p.description, '') as description, p.created_date, p.updated_date, COALESCE(m.name_th, '') as module_name,
 		       (un.module_notification_id IS NOT NULL) as read
 		FROM module_public_relation_notifications p
 		LEFT JOIN modules m ON m.id = p.module_id
@@ -82,6 +84,7 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 			Title:       item.ReferenceTitle,
 			Description: item.ReferenceBody,
 			Date:        item.CreatedDate.Format(time.RFC3339),
+			UpdatedDate: item.UpdatedDate.Format(time.RFC3339),
 			Type:        notifType,
 			Read:        item.Read,
 		})
@@ -93,19 +96,20 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 			Title:       item.Title,
 			Description: item.Description,
 			Date:        item.CreatedDate.Format(time.RFC3339),
+			UpdatedDate: item.UpdatedDate.Format(time.RFC3339),
 			Type:        "news", // Special type to route to PR / "อบจ.ชลบุรี" tab
 			Read:        item.Read,
 		})
 	}
 
-	// 4. Sort by Date descending
+	// 4. Sort by UpdatedDate descending
 	sort.Slice(results, func(i, j int) bool {
-		ti, errI := time.Parse(time.RFC3339, results[i].Date)
-		tj, errJ := time.Parse(time.RFC3339, results[j].Date)
+		ti, errI := time.Parse(time.RFC3339, results[i].UpdatedDate)
+		tj, errJ := time.Parse(time.RFC3339, results[j].UpdatedDate)
 		if errI == nil && errJ == nil {
 			return ti.After(tj)
 		}
-		return results[i].Date > results[j].Date
+		return results[i].UpdatedDate > results[j].UpdatedDate
 	})
 
 	return results, nil

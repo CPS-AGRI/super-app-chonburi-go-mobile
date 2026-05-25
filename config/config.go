@@ -17,6 +17,14 @@ type Config struct {
 	GoogleClientSecret string
 	FacebookAppID      string
 	FacebookAppSecret  string
+	// SMTP (for email confirmations)
+	SMTPHost     string
+	SMTPPort     string
+	SMTPEmail    string
+	SMTPPassword string
+	// Tax Module
+	TaxBillerID string
+	TaxUploadDir string
 }
 
 func LoadConfig() *Config {
@@ -45,6 +53,11 @@ func LoadConfig() *Config {
 		jwtSecret = "chonburi-plus-mobile-secret-key-2024"
 	}
 
+	taxUploadDir := os.Getenv("TAX_UPLOAD_DIR")
+	if taxUploadDir == "" {
+		taxUploadDir = "./uploads"
+	}
+
 	return &Config{
 		AppPort:            port,
 		DBDsn:              dsn,
@@ -55,5 +68,11 @@ func LoadConfig() *Config {
 		GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
 		FacebookAppID:      os.Getenv("FACEBOOK_APP_ID"),
 		FacebookAppSecret:  os.Getenv("FACEBOOK_APP_SECRET"),
+		SMTPHost:           os.Getenv("SMTP_HOST"),
+		SMTPPort:           os.Getenv("SMTP_PORT"),
+		SMTPEmail:          os.Getenv("SMTP_EMAIL"),
+		SMTPPassword:       os.Getenv("SMTP_PASSWORD"),
+		TaxBillerID:        os.Getenv("TAX_BILLER_ID"),
+		TaxUploadDir:       taxUploadDir,
 	}
 }
