@@ -9,6 +9,8 @@ type Module struct {
 	CreatedDate                   time.Time `gorm:"not null;type:timestamptz;column:created_date" json:"created_date"`
 	UpdatedDate                   time.Time `gorm:"not null;type:timestamptz;column:updated_date" json:"updated_date"`
 	IsUsedForUserRegistrationOnly bool      `gorm:"not null;default:false;column:is_used_for_user_registration_only" json:"is_used_for_user_registration_only"`
+	Sequence                      *int      `gorm:"column:sequence" json:"sequence"`
+	Key                           *string   `gorm:"column:key" json:"key"`
 }
 
 func (Module) TableName() string { return "modules" }

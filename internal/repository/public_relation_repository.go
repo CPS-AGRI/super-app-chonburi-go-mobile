@@ -33,11 +33,10 @@ func (r *publicRelationMobileRepository) GetPaginated(moduleId string, page int,
 		return nil, err
 	}
 
-	// Compute Likes, Comments count, and Liked status for each news item
 	for i := range prs {
 		r.db.Model(&domain.PublicRelationLike{}).Where("module_public_relation_id = ?", prs[i].ID).Count(&prs[i].LikesCount)
 		r.db.Model(&domain.PublicRelationComment{}).Where("module_public_relation_id = ? AND status != ?", prs[i].ID, "hidden").Count(&prs[i].CommentsCount)
-		
+
 		var vc domain.PublicRelationVisitorCount
 		if r.db.Where("module_public_relation_id = ?", prs[i].ID).First(&vc).Error == nil {
 			prs[i].ViewCount = vc.Count
@@ -101,7 +100,7 @@ func (r *publicRelationMobileRepository) ToggleLike(prId string, userId string) 
 
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// Like it
+
 			newLike := domain.PublicRelationLike{
 				ModulePublicRelationId: uuid.MustParse(prId),
 				UserId:                 uuid.MustParse(userId),
@@ -118,7 +117,6 @@ func (r *publicRelationMobileRepository) ToggleLike(prId string, userId string) 
 		return false, err
 	}
 
-	// Unlike it
 	if err := r.db.Delete(&like).Error; err != nil {
 		return false, err
 	}

@@ -9,6 +9,9 @@ import (
 	"super-app-chonburi-go-mobile/internal/repository"
 	"super-app-chonburi-go-mobile/internal/usecase"
 	"super-app-chonburi-go-mobile/pkg/database"
+	"super-app-chonburi-go-mobile/pkg/mail"
+	"super-app-chonburi-go-mobile/pkg/storage"
+	minioStorage "super-app-chonburi-go-mobile/pkg/storage/minio"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/compress"
@@ -23,8 +26,14 @@ func main() {
 
 	database.ConnectDB(cfg)
 
+	minioClient, err := minioStorage.NewClient(cfg.MinIO)
+	if err != nil {
+		log.Fatalf("Fatal: Failed to initialize MinIO client: %v", err)
+	}
+
 	app := fiber.New(fiber.Config{
 		AppName:      "Super App Chonburi Mobile API",
+		BodyLimit:    100 * 1024 * 1024,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
@@ -43,7 +52,6 @@ func main() {
 		AllowCredentials: false,
 	}))
 
-	// Dependency Injection
 	authRepo := repository.NewAuthRepository(database.DB)
 	authUseCase := usecase.NewAuthUseCase(authRepo, cfg)
 	http.NewAuthHandler(app, authUseCase)
@@ -56,9 +64,11 @@ func main() {
 	moduleUseCase := usecase.NewModuleUseCase(moduleRepo)
 	http.NewModuleHandler(app, moduleUseCase)
 
-	taxRepo := repository.NewTaxRepository(database.DB)
-	taxUseCase := usecase.NewTaxUseCase(taxRepo)
-	http.NewTaxHandler(app, taxUseCase)
+	mailSender := mail.NewSMTPEmailSender(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPEmail, cfg.SMTPPassword)
+	uploadStorage := storage.NewMinIOStorage(minioClient)
+	taxNewMobileRepo := repository.NewTaxNewMobileRepository(database.DB)
+	taxNewMobileUseCase := usecase.NewTaxNewMobileUseCase(taxNewMobileRepo, mailSender, cfg.TaxBillerID)
+	http.NewTaxNewMobileHandler(app, taxNewMobileUseCase, uploadStorage)
 
 	muniBankRepo := repository.NewMunicipalityBankRepository(database.DB)
 	muniBankUseCase := usecase.NewMunicipalityBankUseCase(muniBankRepo)
@@ -70,7 +80,11 @@ func main() {
 
 	notificationRepo := repository.NewNotificationRepository(database.DB)
 	notificationUseCase := usecase.NewNotificationUseCase(notificationRepo)
-	http.NewNotificationHandler(app, notificationUseCase)
+	http.NewNotificationHandler(app, notificationUseCase, cfg)
+
+	verificationRepo := repository.NewVerificationRepository(database.DB)
+	verificationUseCase := usecase.NewVerificationUseCase(verificationRepo)
+	http.NewVerificationHandler(app, verificationUseCase, cfg)
 
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")

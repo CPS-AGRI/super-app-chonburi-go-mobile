@@ -1,4 +1,4 @@
-package usecase // Updated for DeleteComplaint synchronization
+package usecase
 
 import (
 	"encoding/json"
@@ -9,7 +9,6 @@ import (
 
 	"github.com/google/uuid"
 )
-
 
 type complaintUseCase struct {
 	repo domain.ComplaintRepository
@@ -24,13 +23,11 @@ func (u *complaintUseCase) AddComplaint(complaint *domain.Complaint, imageURLs [
 	complaint.DocumentId = generateDocumentID()
 	complaint.CreatedDate = time.Now()
 	complaint.UpdatedDate = time.Now()
-	
-	// Default to pending if not draft
+
 	if complaint.Status != domain.ComplaintStatusDraft {
 		complaint.Status = domain.ComplaintStatusPending
 	}
 
-	// Map Images
 	for i, url := range imageURLs {
 		complaint.Images = append(complaint.Images, domain.ComplaintImage{
 			ID:                uuid.New().String(),
@@ -44,17 +41,45 @@ func (u *complaintUseCase) AddComplaint(complaint *domain.Complaint, imageURLs [
 		})
 	}
 
-	return u.repo.Create(complaint)
+	err := u.repo.Create(complaint)
+	if err != nil {
+		return err
+	}
+
+	if parsedUserUUID, err := uuid.Parse(complaint.UserId); err == nil {
+		SendNotificationToUser(
+			parsedUserUUID,
+			"ยื่นคำร้องร้องเรียนสำเร็จ",
+			fmt.Sprintf("เราได้รับเรื่องร้องเรียนเลขที่ %s เรียบร้อยแล้ว (สถานะ: รอดำเนินการ)", complaint.DocumentId),
+			complaint.ID,
+			"pending",
+			"complaint",
+		)
+	}
+
+	deptID := ""
+	if complaint.DepartmentId != nil {
+		deptID = *complaint.DepartmentId
+	}
+	SendNotificationToDepartment(
+		deptID,
+		"",
+		"มีเรื่องร้องเรียนใหม่ส่งเข้ามา",
+		fmt.Sprintf("เรื่องร้องเรียนเลขที่ %s เรื่อง: %s รอนุมัติรับเรื่องและส่งต่อทำงาน", complaint.DocumentId, complaint.Description),
+		complaint.ID,
+		"pending",
+	)
+
+	return nil
 }
 
 func (u *complaintUseCase) UpdateComplaint(complaint *domain.Complaint, imageURLs []string) error {
-	// 1. Check if exists and ownership
+
 	existing, err := u.repo.GetByID(complaint.ID, complaint.UserId)
 	if err != nil {
 		return fmt.Errorf("complaint not found or unauthorized")
 	}
 
-	// 2. Update fields
 	existing.Description = complaint.Description
 	existing.ModuleTypeId = complaint.ModuleTypeId
 	existing.Latitude = complaint.Latitude
@@ -63,7 +88,6 @@ func (u *complaintUseCase) UpdateComplaint(complaint *domain.Complaint, imageURL
 	existing.UpdatedDate = time.Now()
 	existing.UpdatedBy = complaint.UserId
 
-	// 3. Map new images
 	existing.Images = []domain.ComplaintImage{}
 	for i, url := range imageURLs {
 		existing.Images = append(existing.Images, domain.ComplaintImage{
@@ -91,9 +115,8 @@ func (u *complaintUseCase) GetDetail(id string, userID string) (*domain.Complain
 		return nil, err
 	}
 
-	// Calculate if rated this round
 	if complaint.Status == domain.ComplaintStatusCompleted {
-		// 1. Find the latest 'completed' activity timestamp
+
 		var lastCompletedAt time.Time
 		for _, act := range complaint.Activities {
 			if act.Status == domain.ComplaintStatusCompleted {
@@ -103,10 +126,9 @@ func (u *complaintUseCase) GetDetail(id string, userID string) (*domain.Complain
 			}
 		}
 
-		// 2. Look for 'user_rating' activity after the last 'completed'
 		for _, act := range complaint.Activities {
 			if act.Status == domain.ActivityStatusUserRating {
-				// If it's after the last completion (or there was no completion activity recorded)
+
 				if act.CreatedDate.After(lastCompletedAt) {
 					var rating domain.ComplaintRating
 					if err := json.Unmarshal([]byte(act.Description), &rating); err == nil {
@@ -123,7 +145,7 @@ func (u *complaintUseCase) GetDetail(id string, userID string) (*domain.Complain
 }
 
 func (u *complaintUseCase) DeleteComplaint(id string, userID string) error {
-	// 1. Check ownership
+
 	_, err := u.repo.GetByID(id, userID)
 	if err != nil {
 		return fmt.Errorf("complaint not found or unauthorized")
@@ -146,10 +168,8 @@ func (u *complaintUseCase) RateComplaint(id string, userID string, rating int, c
 		return fmt.Errorf("can only rate a completed complaint")
 	}
 
-	// 1. Get completer info for assignee_id and department_id
 	assigneeID, departmentID, _ := u.repo.GetCompleterInfo(id)
 
-	// 2. Create history record
 	history := &domain.ComplaintRatingHistory{
 		ID:                uuid.New().String(),
 		ModuleComplaintId: id,
@@ -166,7 +186,6 @@ func (u *complaintUseCase) RateComplaint(id string, userID string, rating int, c
 		return err
 	}
 
-	// 3. Reset active dispute flag on the main complaint
 	complaint.IsDisputed = false
 	if err := u.repo.Update(complaint); err != nil {
 		return err
@@ -188,7 +207,7 @@ func (u *complaintUseCase) RateComplaint(id string, userID string, rating int, c
 	return u.repo.CreateActivity(activity)
 }
 
-func (u *complaintUseCase) DisputeComplaint(id string, userID string, reason string) error {
+func (u *complaintUseCase) DisputeComplaint(id string, userID string, reason string, images []string) error {
 	complaint, err := u.repo.GetByID(id, userID)
 	if err != nil {
 		return fmt.Errorf("complaint not found")
@@ -198,10 +217,8 @@ func (u *complaintUseCase) DisputeComplaint(id string, userID string, reason str
 		return fmt.Errorf("can only dispute a completed complaint")
 	}
 
-	// 1. Get completer info for assignee_id and department_id (the person who failed to complete the job)
 	assigneeID, departmentID, _ := u.repo.GetCompleterInfo(id)
 
-	// 2. Create history record
 	history := &domain.ComplaintRatingHistory{
 		ID:                uuid.New().String(),
 		ModuleComplaintId: id,
@@ -218,6 +235,16 @@ func (u *complaintUseCase) DisputeComplaint(id string, userID string, reason str
 		return err
 	}
 
+	mode, modeErr := u.repo.GetComplaintMode()
+	if modeErr == nil && mode == "central" {
+		complaint.DepartmentId = nil
+	}
+
+	complaint.AssigneeId = nil
+	complaint.Status = domain.ComplaintStatusPending
+	complaint.UpdatedDate = time.Now()
+	complaint.IsDisputed = true
+
 	activity := &domain.ComplaintActivity{
 		ID:                uuid.New().String(),
 		ModuleComplaintId: id,
@@ -229,18 +256,42 @@ func (u *complaintUseCase) DisputeComplaint(id string, userID string, reason str
 		UpdatedDate:       time.Now(),
 	}
 
+	for i, imgUrl := range images {
+		activity.Images = append(activity.Images, domain.ComplaintActivityImage{
+			ID:                        uuid.New().String(),
+			ModuleComplaintActivityId: activity.ID,
+			Url:                       imgUrl,
+			Sequence:                  i + 1,
+			CreatedBy:                 userID,
+			UpdatedBy:                 userID,
+			CreatedDate:               time.Now(),
+			UpdatedDate:               time.Now(),
+		})
+	}
+
 	if err := u.repo.CreateActivity(activity); err != nil {
 		return err
 	}
 
-	// Reset assignee and set status back to pending
-	complaint.AssigneeId = nil
-	complaint.Status = domain.ComplaintStatusPending
-	complaint.UpdatedDate = time.Now()
-	complaint.UpdatedBy = userID
-	complaint.IsDisputed = true // Mark as disputed directly in db to flag current active dispute state
+	err = u.repo.Update(complaint)
+	if err != nil {
+		return err
+	}
 
-	return u.repo.Update(complaint)
+	deptID := ""
+	if complaint.DepartmentId != nil {
+		deptID = *complaint.DepartmentId
+	}
+	SendNotificationToDepartment(
+		deptID,
+		"",
+		"คำร้องเรียนได้รับข้อพิพาทใหม่",
+		fmt.Sprintf("ผู้ยื่นเรื่องคำร้องเรียนเลขที่ %s ได้ส่งยื่นอุทธรณ์/ข้อพิพาท: %s", complaint.DocumentId, reason),
+		complaint.ID,
+		"disputed",
+	)
+
+	return nil
 }
 
 func generateDocumentID() string {
@@ -249,4 +300,3 @@ func generateDocumentID() string {
 	randomPart := rand.Intn(9999)
 	return fmt.Sprintf("CP-%s-%04d", now.Format("20060102"), randomPart)
 }
-

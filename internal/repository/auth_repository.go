@@ -1,8 +1,8 @@
 package repository
 
 import (
-	"super-app-chonburi-go-mobile/internal/domain"
 	"gorm.io/gorm"
+	"super-app-chonburi-go-mobile/internal/domain"
 )
 
 type authRepository struct {
