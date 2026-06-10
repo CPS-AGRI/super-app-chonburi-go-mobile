@@ -27,7 +27,7 @@ func (u *publicRelationMobileUseCase) GetNewsFeed(moduleId string, page int, lim
 }
 
 func (u *publicRelationMobileUseCase) GetNewsDetail(moduleId string, id string, userId string) (*domain.PublicRelation, bool, error) {
-	// Increment visitor count asynchronously (best effort)
+
 	go func() {
 		_ = u.repo.IncrementVisitorCount(id)
 	}()

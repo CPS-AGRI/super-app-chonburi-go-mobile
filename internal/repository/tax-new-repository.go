@@ -13,7 +13,6 @@ type taxNewMobileRepository struct {
 	db *gorm.DB
 }
 
-// NewTaxNewMobileRepository creates a new mobile repository for the self-declaration tax module.
 func NewTaxNewMobileRepository(db *gorm.DB) domain.TaxNewMobileRepository {
 	return &taxNewMobileRepository{db: db}
 }
@@ -65,4 +64,15 @@ func (r *taxNewMobileRepository) GetDeclarationByID(id uuid.UUID) (*domain.TaxDe
 		return nil, err
 	}
 	return &declaration, nil
+}
+
+func (r *taxNewMobileRepository) HasPaidDeclaration(regNumber string, month, year int) (bool, error) {
+	var count int64
+	err := r.db.Model(&domain.TaxDeclaration{}).
+		Where("business_reg_number = ? AND tax_month = ? AND tax_year = ? AND payment_status = ?", regNumber, month, year, "paid").
+		Count(&count).Error
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }

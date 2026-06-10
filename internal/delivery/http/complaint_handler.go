@@ -1,9 +1,9 @@
 package http
 
 import (
-	"super-app-chonburi-go-mobile/internal/domain"
-	"strconv"
 	"github.com/gofiber/fiber/v3"
+	"strconv"
+	"super-app-chonburi-go-mobile/internal/domain"
 )
 
 type complaintHandler struct {
@@ -25,7 +25,7 @@ func NewComplaintHandler(app *fiber.App, useCase domain.ComplaintUseCase) {
 }
 
 func (h *complaintHandler) GetMyComplaints(c fiber.Ctx) error {
-	userID, _ := h.useCase.GetFirstUserID() // Simulated user
+	userID, _ := h.useCase.GetFirstUserID()
 	status := c.Query("status")
 	search := c.Query("search")
 	page, err := strconv.Atoi(c.Query("page", "1"))
@@ -169,13 +169,14 @@ func (h *complaintHandler) Dispute(c fiber.Ctx) error {
 	id := c.Params("id")
 
 	var req struct {
-		Reason string `json:"reason"`
+		Reason string   `json:"reason"`
+		Images []string `json:"images"`
 	}
 	if err := c.Bind().Body(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	if err := h.useCase.DisputeComplaint(id, userID, req.Reason); err != nil {
+	if err := h.useCase.DisputeComplaint(id, userID, req.Reason, req.Images); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(fiber.Map{"message": "dispute submitted successfully"})

@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 )
 
-// StorageProvider defines the interface for file storage backends.
 type StorageProvider interface {
 	Upload(file io.Reader, filename string) (string, error)
 	Delete(filename string) error
@@ -19,7 +18,6 @@ type localStorage struct {
 	baseURL string
 }
 
-// NewLocalStorage creates a local filesystem storage provider.
 func NewLocalStorage(baseDir, baseURL string) StorageProvider {
 	_ = os.MkdirAll(baseDir, 0755)
 	return &localStorage{baseDir: baseDir, baseURL: baseURL}

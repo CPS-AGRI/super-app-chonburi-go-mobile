@@ -11,13 +11,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// TaxNewMobileHandler handles mobile API requests for the self-declaration tax module.
 type TaxNewMobileHandler struct {
 	uc      domain.TaxNewMobileUseCase
 	storage storage.StorageProvider
 }
 
-// NewTaxNewMobileHandler creates a new handler for mobile tax APIs.
 func NewTaxNewMobileHandler(app *fiber.App, uc domain.TaxNewMobileUseCase, store storage.StorageProvider) {
 	handler := &TaxNewMobileHandler{uc: uc, storage: store}
 
@@ -28,8 +26,6 @@ func NewTaxNewMobileHandler(app *fiber.App, uc domain.TaxNewMobileUseCase, store
 	group.Post("/upload", handler.UploadFile)
 }
 
-// GetBusiness searches for a registered business by registration number.
-// GET /api/v1/tax-new/business/:reg_number
 func (h *TaxNewMobileHandler) GetBusiness(c fiber.Ctx) error {
 	regNumber := c.Params("reg_number")
 	if regNumber == "" {
@@ -50,8 +46,6 @@ func (h *TaxNewMobileHandler) GetBusiness(c fiber.Ctx) error {
 	})
 }
 
-// DeclareTax submits a new tax self-declaration.
-// POST /api/v1/tax-new/declare
 func (h *TaxNewMobileHandler) DeclareTax(c fiber.Ctx) error {
 	var req domain.DeclareTaxRequest
 	if err := c.Bind().JSON(&req); err != nil {
@@ -69,8 +63,6 @@ func (h *TaxNewMobileHandler) DeclareTax(c fiber.Ctx) error {
 	})
 }
 
-// GetDeclaration fetches payment status and QR code of an existing declaration.
-// GET /api/v1/tax-new/declare/:id
 func (h *TaxNewMobileHandler) GetDeclaration(c fiber.Ctx) error {
 	idStr := c.Params("id")
 	id, err := uuid.Parse(idStr)
@@ -109,8 +101,6 @@ func (h *TaxNewMobileHandler) GetDeclaration(c fiber.Ctx) error {
 	})
 }
 
-// UploadFile handles PDF/image form submission uploads.
-// POST /api/v1/tax-new/upload
 func (h *TaxNewMobileHandler) UploadFile(c fiber.Ctx) error {
 	fileHeader, err := c.FormFile("file")
 	if err != nil {

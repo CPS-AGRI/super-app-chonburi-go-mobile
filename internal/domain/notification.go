@@ -6,12 +6,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// ModuleNotification maps to module_notifications
 type ModuleNotification struct {
 	ID              uuid.UUID  `gorm:"type:uuid;primaryKey;column:id;default:uuid_generate_v4()" json:"id"`
 	ModuleID        uuid.UUID  `gorm:"type:uuid;not null;column:module_id" json:"module_id"`
 	ModuleTypeID    *uuid.UUID `gorm:"type:uuid;column:module_type_id" json:"module_type_id"`
-	UserID          *uuid.UUID `gorm:"type:uuid;column:user_id" json:"user_id,omitempty"`
+	UserID          *uuid.UUID `gorm:"type:uuid;column:user_id;index:idx_module_notif_user_read_created,priority:1" json:"user_id,omitempty"`
 	UserAdminID     *uuid.UUID `gorm:"type:uuid;column:user_admin_id" json:"user_admin_id,omitempty"`
 	DepartmentID    *uuid.UUID `gorm:"type:uuid;column:department_id" json:"department_id,omitempty"`
 	Role            *string    `gorm:"type:text;column:role" json:"role,omitempty"`
@@ -21,11 +20,12 @@ type ModuleNotification struct {
 	ReferenceBody   string     `gorm:"type:text;not null;column:reference_body" json:"reference_body"`
 	ReferenceStatus string     `gorm:"type:text;not null;column:reference_status" json:"reference_status"`
 	SendDate        *time.Time `gorm:"type:timestamptz;column:send_date" json:"send_date"`
-	Type            string     `gorm:"type:text;not null;column:type" json:"type"`     // "user" | "admin"
-	Status          string     `gorm:"type:text;not null;column:status" json:"status"`   // "pending" | "published"
+	Type            string     `gorm:"type:text;not null;column:type" json:"type"`
+	Status          string     `gorm:"type:text;not null;column:status" json:"status"`
 	State           string     `gorm:"type:text;not null;column:state" json:"state"`
+	IsRead          bool       `gorm:"type:boolean;not null;default:false;column:is_read;index:idx_module_notif_user_read_created,priority:2" json:"is_read"`
 	CreatedBy       string     `gorm:"type:text;not null;default:'';column:created_by" json:"created_by"`
-	CreatedDate     time.Time  `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:created_date" json:"created_date"`
+	CreatedDate     time.Time  `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:created_date;index:idx_module_notif_user_read_created,priority:3" json:"created_date"`
 	UpdatedBy       string     `gorm:"type:text;not null;default:'';column:updated_by" json:"updated_by"`
 	UpdatedDate     time.Time  `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:updated_date" json:"updated_date"`
 }
@@ -34,7 +34,6 @@ func (ModuleNotification) TableName() string {
 	return "module_notifications"
 }
 
-// ModuleUserNotification maps to module_user_notifications
 type ModuleUserNotification struct {
 	ModuleNotificationID uuid.UUID `gorm:"type:uuid;primaryKey;column:module_notification_id" json:"module_notification_id"`
 	UserID               uuid.UUID `gorm:"type:uuid;primaryKey;column:user_id" json:"user_id"`
@@ -45,15 +44,28 @@ func (ModuleUserNotification) TableName() string {
 	return "module_user_notifications"
 }
 
-// NotificationResponseItem matches the structure expected by the mobile client
+type ModuleDeviceToken struct {
+	ID          uuid.UUID `gorm:"type:uuid;primaryKey;column:id;default:uuid_generate_v4()" json:"id"`
+	UserID      uuid.UUID `gorm:"type:uuid;not null;column:user_id;index:idx_module_device_tokens_user" json:"user_id"`
+	Token       string    `gorm:"type:text;not null;column:token;unique" json:"token"`
+	DeviceType  string    `gorm:"type:text;not null;column:device_type" json:"device_type"`
+	CreatedDate time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:created_date" json:"created_date"`
+	UpdatedDate time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:updated_date" json:"updated_date"`
+}
+
+func (ModuleDeviceToken) TableName() string {
+	return "module_device_tokens"
+}
+
 type NotificationResponseItem struct {
 	ID          string `json:"id"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	Date        string `json:"date"`
 	UpdatedDate string `json:"updated_date"`
-	Type        string `json:"type"` // "general", "flood", "tax"
+	Type        string `json:"type"`
 	Read        bool   `json:"read"`
+	ReferenceID string `json:"reference_id,omitempty"`
 }
 
 type NotificationRepository interface {

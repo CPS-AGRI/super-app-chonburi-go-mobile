@@ -59,7 +59,6 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 			})
 		}
 
-		// Check expiration manually if needed, although ParseWithClaims does this
 		if claims.ExpiresAt != nil && claims.ExpiresAt.Before(time.Now()) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "Unauthorized: Token expired",

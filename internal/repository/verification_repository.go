@@ -37,12 +37,18 @@ func (r *verificationRepository) GetModulesForMenu() ([]domain.Module, error) {
 }
 
 func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domain.SubmitVerificationRequest) error {
-	updates := map[string]interface{}{
-		"verification_status": string(domain.VerificationStatusPending),
-		"id_card_type":        req.IdCardType,
-		"id_card_photo_url":   req.IdCardPhotoUrl,
-		"id_card_expiry":      req.IdCardExpiry,
-		"updated_date":        time.Now(),
+	updates := struct {
+		VerificationStatus string     `gorm:"column:verification_status"`
+		IdCardType         int        `gorm:"column:id_card_type"`
+		IdCardPhotoUrl     string     `gorm:"column:id_card_photo_url"`
+		IdCardExpiry       *time.Time `gorm:"column:id_card_expiry"`
+		UpdatedDate        time.Time  `gorm:"column:updated_date"`
+	}{
+		VerificationStatus: string(domain.VerificationStatusPending),
+		IdCardType:         req.IdCardType,
+		IdCardPhotoUrl:     req.IdCardPhotoUrl,
+		IdCardExpiry:       req.IdCardExpiry,
+		UpdatedDate:        time.Now(),
 	}
 	return r.db.Model(&domain.UserInformation{}).
 		Where("user_id = ?", userID).

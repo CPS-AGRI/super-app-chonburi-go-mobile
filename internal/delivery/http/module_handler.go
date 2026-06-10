@@ -1,8 +1,8 @@
 package http
 
 import (
-	"super-app-chonburi-go-mobile/internal/domain"
 	"github.com/gofiber/fiber/v3"
+	"super-app-chonburi-go-mobile/internal/domain"
 )
 
 type moduleHandler struct {

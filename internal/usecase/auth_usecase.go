@@ -26,7 +26,7 @@ func NewAuthUseCase(repo domain.AuthRepository, cfg *config.Config) domain.AuthU
 }
 
 func (u *authUseCase) LoginWithGoogle(idToken string) (*domain.AuthResponse, error) {
-	// 1. Verify Google ID Token
+
 	payload, err := idtoken.Validate(context.Background(), idToken, u.config.GoogleClientID)
 	if err != nil {
 		return nil, errors.New("invalid google token")
@@ -37,16 +37,15 @@ func (u *authUseCase) LoginWithGoogle(idToken string) (*domain.AuthResponse, err
 	name := payload.Claims["name"].(string)
 	picture := payload.Claims["picture"].(string)
 
-	// 2. Check if user exists
 	user, err := u.repo.GetByProviderID("google", googleID)
 	if err != nil {
-		// Try by email if provider ID not found
+
 		user, err = u.repo.GetByEmail(email)
 		if err != nil {
-			// 3. Create new user if not exists
+
 			user = &domain.AppUser{
 				ID:              uuid.New(),
-				PhoneNumber:     "", // OAuth users might not have phone initially
+				PhoneNumber:     "",
 				Provider:        stringPtr("google"),
 				ProviderId:      &googleID,
 				ImageProfileUrl: &picture,
@@ -68,14 +67,13 @@ func (u *authUseCase) LoginWithGoogle(idToken string) (*domain.AuthResponse, err
 				return nil, err
 			}
 		} else {
-			// Update provider info for existing email user
+
 			user.Provider = stringPtr("google")
 			user.ProviderId = &googleID
 			u.repo.Update(user)
 		}
 	}
 
-	// 4. Generate Tokens
 	accessToken, err := u.generateAccessToken(user)
 	if err != nil {
 		return nil, err
@@ -110,7 +108,7 @@ func (u *authUseCase) generateAccessToken(user *domain.AppUser) (string, error) 
 	claims := jwt.MapClaims{
 		"user_id": user.ID.String(),
 		"email":   email,
-		"exp":     time.Now().Add(time.Hour * 24).Unix(), // 24 hours
+		"exp":     time.Now().Add(time.Hour * 24).Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(u.config.JWTSecret))
@@ -119,7 +117,7 @@ func (u *authUseCase) generateAccessToken(user *domain.AppUser) (string, error) 
 func (u *authUseCase) generateRefreshToken(user *domain.AppUser) (string, error) {
 	claims := jwt.MapClaims{
 		"user_id": user.ID.String(),
-		"exp":     time.Now().Add(time.Hour * 24 * 30).Unix(), // 30 days
+		"exp":     time.Now().Add(time.Hour * 24 * 30).Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(u.config.JWTSecret))

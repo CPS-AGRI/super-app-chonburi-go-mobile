@@ -48,12 +48,12 @@ func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error
 		if m.IsUsedForUserRegistrationOnly && verificationStatus != "verified" {
 			status = "lock"
 		}
-		
+
 		key := ""
 		if m.Key != nil {
 			key = *m.Key
 		} else {
-			key = m.ID // fallback to ID
+			key = m.ID
 		}
 
 		menuItems = append(menuItems, domain.MenuItemResponse{
@@ -84,12 +84,6 @@ func (u *verificationUseCase) SubmitVerification(userID uuid.UUID, req *domain.S
 	if user.Information == nil {
 		return errors.New("user information profile not found")
 	}
-
-	// Allow re-submitting in development/UAT to test the flow multiple times
-	// status := user.Information.VerificationStatus
-	// if status == string(domain.VerificationStatusPending) || status == string(domain.VerificationStatusVerified) {
-	// 	return errors.New("cannot submit verification in current status: " + status)
-	// }
 
 	return u.repo.SubmitVerification(userID, req)
 }

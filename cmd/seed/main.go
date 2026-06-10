@@ -13,13 +13,11 @@ import (
 )
 
 func main() {
-	// 1. Load config
+
 	cfg := config.LoadConfig()
 
-	// 2. Connect to Database
 	database.ConnectDB(cfg)
 
-	// --- SEED USERS ---
 	type SeedUser struct {
 		User    domain.AppUser
 		Profile domain.UserInformation
@@ -33,14 +31,14 @@ func main() {
 				CreatedBy:   "seed_data",
 			},
 			Profile: domain.UserInformation{
-				Name:           "สมชาย",
-				LastName:       "สายชล",
-				Email:          stringPtr("somchai@example.com"),
-				Phone:          "0812345671",
+				Name:                    "สมชาย",
+				LastName:                "สายชล",
+				Email:                   stringPtr("somchai@example.com"),
+				Phone:                   "0812345671",
 				IdentityNumberEncrypted: "ENC_1100112233441",
 				LaserIdEncrypted:        "ENC_ME0123456781",
-				Status:         "active",
-				IsConsent:      true,
+				Status:                  "active",
+				IsConsent:               true,
 			},
 		},
 	}
@@ -60,13 +58,13 @@ func main() {
 		data.User.ID = uuid.New()
 		data.User.PinHash = pinHash
 		data.User.PhoneNumberHash = hashValue(data.User.PhoneNumber)
-		
+
 		tx := database.DB.Begin()
 		tx.Create(&data.User)
 		data.Profile.UserId = data.User.ID
 		tx.Create(&data.Profile)
 		tx.Commit()
-		
+
 		firstUserID = data.User.ID.String()
 		log.Printf("✅ Seeded User: %s", data.Profile.Name)
 	}

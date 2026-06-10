@@ -20,13 +20,11 @@ func NewVerificationHandler(app *fiber.App, useCase domain.VerificationUseCase, 
 		cfg:     cfg,
 	}
 
-	// Verification endpoints (protected)
 	vGroup := app.Group("/api/v1/verification", jwtutil.RequireAuth(cfg))
 	vGroup.Post("/submit", handler.Submit)
 	vGroup.Get("/status", handler.GetStatus)
 	vGroup.Post("/fcm-token", handler.RegisterFCMToken)
 
-	// Auth me endpoint (protected)
 	app.Get("/api/v1/auth/me", jwtutil.RequireAuth(cfg), handler.Me)
 }
 

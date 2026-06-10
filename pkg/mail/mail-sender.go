@@ -6,7 +6,6 @@ import (
 	"strings"
 )
 
-// EmailSender interface defines email sending behavior
 type EmailSender interface {
 	SendHTML(to []string, subject, body string) error
 }
@@ -18,7 +17,6 @@ type smtpEmailSender struct {
 	password string
 }
 
-// NewSMTPEmailSender creates a new SMTP email sender
 func NewSMTPEmailSender(host, port, email, password string) EmailSender {
 	return &smtpEmailSender{
 		host:     host,
@@ -28,7 +26,6 @@ func NewSMTPEmailSender(host, port, email, password string) EmailSender {
 	}
 }
 
-// SendHTML sends an HTML formatted email
 func (s *smtpEmailSender) SendHTML(to []string, subject, body string) error {
 	if s.host == "" || s.port == "" || s.email == "" {
 		return fmt.Errorf("SMTP configuration is incomplete (host=%s, port=%s, email=%s)", s.host, s.port, s.email)

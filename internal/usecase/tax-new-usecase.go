@@ -19,10 +19,9 @@ type taxNewMobileUseCase struct {
 	billerID   string
 }
 
-// NewTaxNewMobileUseCase creates a new use case for mobile tax self-declaration.
 func NewTaxNewMobileUseCase(repo domain.TaxNewMobileRepository, mailSender mail.EmailSender, billerID string) domain.TaxNewMobileUseCase {
 	if billerID == "" {
-		billerID = "099400016485800" // Default Chonburi PAO Biller ID
+		billerID = "099400016485800"
 	}
 	return &taxNewMobileUseCase{
 		repo:       repo,
@@ -51,12 +50,22 @@ func (u *taxNewMobileUseCase) GetBusiness(regNumber string) (*domain.TaxBusiness
 		rateUnit = rate.RateUnit
 	}
 
+	now := time.Now()
+	currentMonth := int(now.Month())
+	currentYear := now.Year()
+
+	hasPaid, err := u.repo.HasPaidDeclaration(business.BusinessRegNumber, currentMonth, currentYear)
+	if err != nil {
+		return nil, err
+	}
+
 	return &domain.TaxBusinessDTO{
 		BusinessRegNumber: business.BusinessRegNumber,
 		NameTH:            business.NameTH,
 		TaxType:           business.TaxType,
 		TaxRate:           rateValue,
 		RateUnit:          rateUnit,
+		HasPaidThisMonth:  hasPaid,
 	}, nil
 }
 
@@ -77,20 +86,17 @@ func (u *taxNewMobileUseCase) DeclareTax(req domain.DeclareTaxRequest) (*domain.
 		return nil, errors.New("active tax rate not found for tax type " + business.TaxType)
 	}
 
-	// 1. Calculate Tax
 	calculatedTax := req.MonthlyRevenue * rate.RateValue
 	if rate.RateUnit == "percentage" {
 		calculatedTax = req.MonthlyRevenue * (rate.RateValue / 100.0)
 	}
 
-	// 2. Determine Declaration Version
 	version, err := u.repo.GetLatestDeclarationVersion(req.BusinessRegNumber, business.TaxType, req.TaxMonth, req.TaxYear)
 	if err != nil {
 		return nil, err
 	}
 	newVersion := version + 1
 
-	// 3. Generate Ref1 & Ref2
 	var typeCode string
 	switch business.TaxType {
 	case "hotel_fee":
@@ -105,13 +111,11 @@ func (u *taxNewMobileUseCase) DeclareTax(req domain.DeclareTaxRequest) (*domain.
 	ref1 := fmt.Sprintf("%s%s", business.BusinessRegNumber, typeCode)
 	ref2 := fmt.Sprintf("%04d%02d%02d", req.TaxYear, req.TaxMonth, newVersion)
 
-	// 4. Generate PromptPay QR Content
 	qrContent, err := qr.GeneratePromptPayBillPayment(u.billerID, ref1, ref2, calculatedTax)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate promptpay QR: %w", err)
 	}
 
-	// 5. Create Tax Declaration Record
 	declaration := &domain.TaxDeclaration{
 		ID:                 uuid.New(),
 		BusinessID:         business.ID,
@@ -138,6 +142,16 @@ func (u *taxNewMobileUseCase) DeclareTax(req domain.DeclareTaxRequest) (*domain.
 		return nil, err
 	}
 
+	SendNotificationToDepartment(
+		"",
+		"officer",
+		"มีรายการยื่นแบบภาษีใหม่",
+		fmt.Sprintf("สถานประกอบการ %s ได้ยื่นแบบภาษี %s รอบประจำเดือน %s %d ยอดภาษีคำนวณ %s บาท รอตอบรับ",
+			business.NameTH, getTaxTypeNameTH(declaration.TaxType), getThaiMonthName(declaration.TaxMonth), declaration.TaxYear+543, formatWithCommas(declaration.CalculatedTax)),
+		declaration.ID.String(),
+		"pending",
+	)
+
 	return &domain.DeclareTaxResponse{
 		DeclarationID: declaration.ID,
 		CalculatedTax: declaration.CalculatedTax,
@@ -151,10 +165,6 @@ func (u *taxNewMobileUseCase) DeclareTax(req domain.DeclareTaxRequest) (*domain.
 func (u *taxNewMobileUseCase) GetDeclaration(id uuid.UUID) (*domain.TaxDeclaration, error) {
 	return u.repo.GetDeclarationByID(id)
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
 
 func getThaiMonthName(m int) string {
 	months := []string{"", "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"}
@@ -193,7 +203,6 @@ func formatWithCommas(val float64) string {
 	return strings.Join(result, "") + "." + decPart
 }
 
-// sendPaymentSuccessEmail sends an HTML confirmation email when payment is reconciled.
 func (u *taxNewMobileUseCase) sendPaymentSuccessEmail(decl *domain.TaxDeclaration) {
 	if decl.Business == nil {
 		return

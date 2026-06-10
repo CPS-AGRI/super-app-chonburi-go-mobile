@@ -52,14 +52,14 @@ type MenuItemResponse struct {
 }
 
 type MeResponse struct {
-	UserID             uuid.UUID              `json:"user_id"`
-	Name               string                 `json:"name"`
-	LastName           string                 `json:"last_name"`
-	Phone              string                 `json:"phone"`
-	Email              *string                `json:"email,omitempty"`
-	ImageProfileUrl    *string                `json:"image_profile_url,omitempty"`
-	VerificationStatus string                 `json:"verification_status"`
-	MenuItems          []MenuItemResponse     `json:"menu_items"`
+	UserID             uuid.UUID          `json:"user_id"`
+	Name               string             `json:"name"`
+	LastName           string             `json:"last_name"`
+	Phone              string             `json:"phone"`
+	Email              *string            `json:"email,omitempty"`
+	ImageProfileUrl    *string            `json:"image_profile_url,omitempty"`
+	VerificationStatus string             `json:"verification_status"`
+	MenuItems          []MenuItemResponse `json:"menu_items"`
 }
 
 type VerificationRepository interface {

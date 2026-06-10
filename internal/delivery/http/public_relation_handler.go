@@ -16,14 +16,11 @@ func NewPublicRelationMobileHandler(app *fiber.App, uc domain.PublicRelationMobi
 
 	group := app.Group("/api/v1/public-relations")
 
-	// Global Screens
 	group.Get("/welcome-screen", handler.GetWelcomeScreen)
 
-	// News Modules
 	group.Get("/modules/:moduleId", handler.GetNewsFeed)
 	group.Get("/modules/:moduleId/news/:id", handler.GetNewsDetail)
 
-	// Interactions
 	group.Post("/news/:id/like", handler.ToggleLike)
 	group.Post("/news/:id/comments", handler.AddComment)
 	group.Get("/news/:id/comments", handler.GetComments)
@@ -60,7 +57,7 @@ func (h *publicRelationMobileHandler) GetNewsFeed(c fiber.Ctx) error {
 func (h *publicRelationMobileHandler) GetNewsDetail(c fiber.Ctx) error {
 	moduleId := c.Params("moduleId")
 	id := c.Params("id")
-	userId := c.Query("user_id") // Mock user_id if passed, or extract from JWT if available.
+	userId := c.Query("user_id")
 
 	news, liked, err := h.uc.GetNewsDetail(moduleId, id, userId)
 	if err != nil {
