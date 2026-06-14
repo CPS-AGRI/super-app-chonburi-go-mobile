@@ -63,7 +63,7 @@ func (u *complaintUseCase) AddComplaint(complaint *domain.Complaint, imageURLs [
 	}
 	SendNotificationToDepartment(
 		deptID,
-		"",
+		"Managers",
 		"มีเรื่องร้องเรียนใหม่ส่งเข้ามา",
 		fmt.Sprintf("เรื่องร้องเรียนเลขที่ %s เรื่อง: %s รอนุมัติรับเรื่องและส่งต่อทำงาน", complaint.DocumentId, complaint.Description),
 		complaint.ID,
@@ -284,7 +284,7 @@ func (u *complaintUseCase) DisputeComplaint(id string, userID string, reason str
 	}
 	SendNotificationToDepartment(
 		deptID,
-		"",
+		"Managers",
 		"คำร้องเรียนได้รับข้อพิพาทใหม่",
 		fmt.Sprintf("ผู้ยื่นเรื่องคำร้องเรียนเลขที่ %s ได้ส่งยื่นอุทธรณ์/ข้อพิพาท: %s", complaint.DocumentId, reason),
 		complaint.ID,
