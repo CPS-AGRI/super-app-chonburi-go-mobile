@@ -144,7 +144,7 @@ func (u *taxNewMobileUseCase) DeclareTax(req domain.DeclareTaxRequest) (*domain.
 
 	SendNotificationToDepartment(
 		"",
-		"officer",
+		"Employees",
 		"มีรายการยื่นแบบภาษีใหม่",
 		fmt.Sprintf("สถานประกอบการ %s ได้ยื่นแบบภาษี %s รอบประจำเดือน %s %d ยอดภาษีคำนวณ %s บาท รอตอบรับ",
 			business.NameTH, getTaxTypeNameTH(declaration.TaxType), getThaiMonthName(declaration.TaxMonth), declaration.TaxYear+543, formatWithCommas(declaration.CalculatedTax)),
