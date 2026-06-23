@@ -98,10 +98,46 @@ type AuthRepository interface {
 	Update(user *AppUser) error
 }
 
+type OTPRequest struct {
+	PhoneNumber string `json:"phone_number"`
+}
+
+type OTPRequestResponse struct {
+	Success bool   `json:"success"`
+	Ref     string `json:"ref"`
+	OTP     string `json:"otp,omitempty"` // สำหรับทดสอบใน dev environment
+}
+
+type OTPVerifyRequest struct {
+	PhoneNumber string `json:"phone_number"`
+	OTP         string `json:"otp"`
+	Ref         string `json:"ref"`
+}
+
+type OTPVerifyResponse struct {
+	Success      bool   `json:"success"`
+	IsRegistered bool   `json:"is_registered"`
+	TempToken    string `json:"temp_token,omitempty"`
+}
+
+type RegisterRequest struct {
+	Pin       string `json:"pin"`
+	TempToken string `json:"temp_token"`
+}
+
+type PinLoginRequest struct {
+	PhoneNumber string `json:"phone_number"`
+	Pin         string `json:"pin"`
+}
+
 type AuthUseCase interface {
 	LoginWithGoogle(idToken string) (*AuthResponse, error)
 	LoginWithFacebook(accessToken string) (*AuthResponse, error)
 	RefreshToken(refreshToken string) (*AuthResponse, error)
+	RequestOTP(phoneNumber string) (*OTPRequestResponse, error)
+	VerifyOTP(phoneNumber, otp, ref string) (*OTPVerifyResponse, error)
+	Register(pin, tempToken string) (*AuthResponse, error)
+	LoginWithPin(phoneNumber, pin string) (*AuthResponse, error)
 }
 
 type AuthResponse struct {

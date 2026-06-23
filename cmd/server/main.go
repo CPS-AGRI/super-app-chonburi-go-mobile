@@ -58,7 +58,7 @@ func main() {
 
 	complaintRepo := repository.NewComplaintRepository(database.DB)
 	complaintUseCase := usecase.NewComplaintUseCase(complaintRepo)
-	http.NewComplaintHandler(app, complaintUseCase)
+	http.NewComplaintHandler(app, complaintUseCase, cfg)
 
 	moduleRepo := repository.NewModuleRepository(database.DB)
 	moduleUseCase := usecase.NewModuleUseCase(moduleRepo)

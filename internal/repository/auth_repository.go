@@ -48,7 +48,7 @@ func (r *authRepository) GetByPhoneNumber(phoneNumber string) (*domain.AppUser, 
 
 func (r *authRepository) Create(user *domain.AppUser) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(user).Error; err != nil {
+		if err := tx.Omit("Information").Create(user).Error; err != nil {
 			return err
 		}
 		if user.Information != nil {
