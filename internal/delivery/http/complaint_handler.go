@@ -1,19 +1,22 @@
 package http
 
 import (
-	"github.com/gofiber/fiber/v3"
 	"strconv"
+	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
+	"super-app-chonburi-go-mobile/pkg/jwtutil"
+
+	"github.com/gofiber/fiber/v3"
 )
 
 type complaintHandler struct {
 	useCase domain.ComplaintUseCase
 }
 
-func NewComplaintHandler(app *fiber.App, useCase domain.ComplaintUseCase) {
+func NewComplaintHandler(app *fiber.App, useCase domain.ComplaintUseCase, cfg *config.Config) {
 	handler := &complaintHandler{useCase: useCase}
 
-	group := app.Group("/api/v1/complaints")
+	group := app.Group("/api/v1/complaints", jwtutil.RequireAuth(cfg))
 
 	group.Get("/", handler.GetMyComplaints)
 	group.Post("/", handler.AddComplaint)
@@ -25,7 +28,10 @@ func NewComplaintHandler(app *fiber.App, useCase domain.ComplaintUseCase) {
 }
 
 func (h *complaintHandler) GetMyComplaints(c fiber.Ctx) error {
-	userID, _ := h.useCase.GetFirstUserID()
+	userID, err := jwtutil.ExtractUserID(c)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
 	status := c.Query("status")
 	search := c.Query("search")
 	page, err := strconv.Atoi(c.Query("page", "1"))
@@ -46,9 +52,9 @@ func (h *complaintHandler) GetMyComplaints(c fiber.Ctx) error {
 }
 
 func (h *complaintHandler) AddComplaint(c fiber.Ctx) error {
-	userID, err := h.useCase.GetFirstUserID()
+	userID, err := jwtutil.ExtractUserID(c)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to get default user: " + err.Error()})
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	var req struct {
@@ -83,9 +89,9 @@ func (h *complaintHandler) AddComplaint(c fiber.Ctx) error {
 }
 
 func (h *complaintHandler) UpdateComplaint(c fiber.Ctx) error {
-	userID, err := h.useCase.GetFirstUserID()
+	userID, err := jwtutil.ExtractUserID(c)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": "Failed to get default user: " + err.Error()})
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	id := c.Params("id")
@@ -121,7 +127,10 @@ func (h *complaintHandler) UpdateComplaint(c fiber.Ctx) error {
 }
 
 func (h *complaintHandler) GetDetail(c fiber.Ctx) error {
-	userID, _ := h.useCase.GetFirstUserID()
+	userID, err := jwtutil.ExtractUserID(c)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
 	id := c.Params("id")
 
 	complaint, err := h.useCase.GetDetail(id, userID)
@@ -133,7 +142,10 @@ func (h *complaintHandler) GetDetail(c fiber.Ctx) error {
 }
 
 func (h *complaintHandler) CancelComplaint(c fiber.Ctx) error {
-	userID, _ := h.useCase.GetFirstUserID()
+	userID, err := jwtutil.ExtractUserID(c)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
 	id := c.Params("id")
 
 	if err := h.useCase.DeleteComplaint(id, userID); err != nil {
@@ -144,7 +156,10 @@ func (h *complaintHandler) CancelComplaint(c fiber.Ctx) error {
 }
 
 func (h *complaintHandler) Rate(c fiber.Ctx) error {
-	userID, _ := h.useCase.GetFirstUserID()
+	userID, err := jwtutil.ExtractUserID(c)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
 	id := c.Params("id")
 
 	var req struct {
@@ -165,7 +180,10 @@ func (h *complaintHandler) Rate(c fiber.Ctx) error {
 }
 
 func (h *complaintHandler) Dispute(c fiber.Ctx) error {
-	userID, _ := h.useCase.GetFirstUserID()
+	userID, err := jwtutil.ExtractUserID(c)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
 	id := c.Params("id")
 
 	var req struct {

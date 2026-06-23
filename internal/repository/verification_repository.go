@@ -1,6 +1,8 @@
 package repository
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"time"
 
 	"super-app-chonburi-go-mobile/internal/domain"
@@ -37,19 +39,42 @@ func (r *verificationRepository) GetModulesForMenu() ([]domain.Module, error) {
 }
 
 func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domain.SubmitVerificationRequest) error {
-	updates := struct {
-		VerificationStatus string     `gorm:"column:verification_status"`
-		IdCardType         int        `gorm:"column:id_card_type"`
-		IdCardPhotoUrl     string     `gorm:"column:id_card_photo_url"`
-		IdCardExpiry       *time.Time `gorm:"column:id_card_expiry"`
-		UpdatedDate        time.Time  `gorm:"column:updated_date"`
-	}{
-		VerificationStatus: string(domain.VerificationStatusPending),
-		IdCardType:         req.IdCardType,
-		IdCardPhotoUrl:     req.IdCardPhotoUrl,
-		IdCardExpiry:       req.IdCardExpiry,
-		UpdatedDate:        time.Now(),
+	h := sha256.New()
+	h.Write([]byte(req.IdentityNumber))
+	identityHash := hex.EncodeToString(h.Sum(nil))
+
+	h2 := sha256.New()
+	h2.Write([]byte(req.LaserID))
+	laserHash := hex.EncodeToString(h2.Sum(nil))
+
+	updates := map[string]interface{}{
+		"verification_status":       string(domain.VerificationStatusPending),
+		"id_card_type":              req.IdCardType,
+		"id_card_photo_url":         req.IdCardPhotoUrl,
+		"id_card_expiry":            req.IdCardExpiry,
+		"identity_number_encrypted": "ENC_" + req.IdentityNumber,
+		"identity_number_hash":      identityHash,
+		"laser_id_encrypted":        "ENC_" + req.LaserID,
+		"laser_id_hash":             laserHash,
+		"prefix":                    req.Prefix,
+		"name":                      req.Name,
+		"last_name":                 req.LastName,
+		"email":                     req.Email,
+		"birthday":                  req.Birthday,
+		"house_number":              req.HouseNumber,
+		"village_number":            req.VillageNumber,
+		"alley":                     req.Alley,
+		"intersection":              req.Intersection,
+		"road":                      req.Road,
+		"subdistrict":               req.Subdistrict,
+		"district":                  req.District,
+		"province":                  req.Province,
+		"postal_code":               req.PostalCode,
+		"building_name":             req.BuildingName,
+		"room_number":               req.RoomNumber,
+		"updated_date":              time.Now(),
 	}
+
 	return r.db.Model(&domain.UserInformation{}).
 		Where("user_id = ?", userID).
 		Updates(updates).Error

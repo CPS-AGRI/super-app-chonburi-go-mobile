@@ -31,6 +31,24 @@ type SubmitVerificationRequest struct {
 	IdCardType     int        `json:"id_card_type"    validate:"required,oneof=1 2"`
 	IdCardExpiry   *time.Time `json:"id_card_expiry"`
 	IdCardPhotoUrl string     `json:"id_card_photo_url" validate:"required"`
+
+	Prefix   string     `json:"prefix"`
+	Name     string     `json:"name"`
+	LastName string     `json:"last_name"`
+	Email    *string    `json:"email"`
+	Birthday *time.Time `json:"birthday"`
+
+	HouseNumber   string `json:"house_number"`
+	VillageNumber string `json:"village_number"`
+	Alley         string `json:"alley"`
+	Intersection  string `json:"intersection"`
+	Road          string `json:"road"`
+	Subdistrict   string `json:"subdistrict"`
+	District      string `json:"district"`
+	Province      string `json:"province"`
+	PostalCode    int    `json:"postal_code"`
+	BuildingName  string `json:"building_name"`
+	RoomNumber    string `json:"room_number"`
 }
 
 type RegisterFCMTokenRequest struct {

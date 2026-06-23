@@ -44,18 +44,7 @@ func (ModuleUserNotification) TableName() string {
 	return "module_user_notifications"
 }
 
-type ModuleDeviceToken struct {
-	ID          uuid.UUID `gorm:"type:uuid;primaryKey;column:id;default:uuid_generate_v4()" json:"id"`
-	UserID      uuid.UUID `gorm:"type:uuid;not null;column:user_id;index:idx_module_device_tokens_user" json:"user_id"`
-	Token       string    `gorm:"type:text;not null;column:token;unique" json:"token"`
-	DeviceType  string    `gorm:"type:text;not null;column:device_type" json:"device_type"`
-	CreatedDate time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:created_date" json:"created_date"`
-	UpdatedDate time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:updated_date" json:"updated_date"`
-}
 
-func (ModuleDeviceToken) TableName() string {
-	return "module_device_tokens"
-}
 
 type NotificationResponseItem struct {
 	ID          string `json:"id"`
