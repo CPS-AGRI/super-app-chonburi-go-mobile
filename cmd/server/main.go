@@ -86,6 +86,10 @@ func main() {
 	verificationUseCase := usecase.NewVerificationUseCase(verificationRepo)
 	http.NewVerificationHandler(app, verificationUseCase, cfg)
 
+	cctvRepo := repository.NewCCTVRepository(database.DB)
+	cctvUseCase := usecase.NewCCTVUseCase(cctvRepo)
+	http.NewCCTVHandler(app, cctvUseCase, cfg)
+
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")
 	})

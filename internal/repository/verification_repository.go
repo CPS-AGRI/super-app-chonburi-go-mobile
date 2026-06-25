@@ -75,9 +75,78 @@ func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domai
 		"updated_date":              time.Now(),
 	}
 
-	return r.db.Model(&domain.UserInformation{}).
+	err := r.db.Model(&domain.UserInformation{}).
 		Where("user_id = ?", userID).
 		Updates(updates).Error
+	if err != nil {
+		return err
+	}
+
+	// Create admin notification
+	var moduleID uuid.UUID
+	_ = r.db.Table("modules").Select("id").Where("key = ? OR key = ?", "register", "ModuleIdentityVerifications").Limit(1).Scan(&moduleID)
+	if moduleID == uuid.Nil {
+		moduleID = uuid.MustParse("8c7ce421-5d1f-41de-840b-14ac192d4778") // Fallback valid Module ID (การยืนยันตัวตน)
+	}
+
+	var deptID string
+	_ = r.db.Table("department_modules").Select("department_id").Where("module_id = ?", moduleID).Limit(1).Scan(&deptID)
+
+	var deptUUID *uuid.UUID
+	if deptID != "" {
+		if parsed, err := uuid.Parse(deptID); err == nil {
+			deptUUID = &parsed
+		}
+	}
+
+	roleEmp := "Employees"
+	roleMgr := "Managers"
+	title := "มีคำขอยืนยันตัวตนใหม่"
+	body := "คำขอตรวจสอบการยืนยันตัวตนจากคุณ " + req.Name + " " + req.LastName
+
+	// 1. Notification for Employees
+	newNotifEmp := domain.ModuleNotification{
+		ID:              uuid.New(),
+		ModuleID:        moduleID,
+		DepartmentID:    deptUUID,
+		Role:            &roleEmp,
+		ReferenceID:     userID.String(),
+		ReferenceTitle:  title,
+		ReferenceBody:   body,
+		ReferenceStatus: "pending",
+		Type:            "admin",
+		Status:          "published",
+		State:           "unread",
+		IsRead:          false,
+		CreatedBy:       "mobile_submit",
+		CreatedDate:     time.Now(),
+		UpdatedBy:       "mobile_submit",
+		UpdatedDate:     time.Now(),
+	}
+	_ = r.db.Create(&newNotifEmp)
+
+	// 2. Notification for Managers
+	newNotifMgr := domain.ModuleNotification{
+		ID:              uuid.New(),
+		ModuleID:        moduleID,
+		DepartmentID:    deptUUID,
+		Role:            &roleMgr,
+		ReferenceID:     userID.String(),
+		ReferenceTitle:  title,
+		ReferenceBody:   body,
+		ReferenceStatus: "pending",
+		Type:            "admin",
+		Status:          "published",
+		State:           "unread",
+		IsRead:          false,
+		CreatedBy:       "mobile_submit",
+		CreatedDate:     time.Now(),
+		UpdatedBy:       "mobile_submit",
+		UpdatedDate:     time.Now(),
+	}
+	_ = r.db.Create(&newNotifMgr)
+
+	return nil
 }
 
 func (r *verificationRepository) GetVerificationStatus(userID uuid.UUID) (*domain.VerificationStatusResponse, error) {
