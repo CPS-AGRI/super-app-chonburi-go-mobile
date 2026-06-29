@@ -15,11 +15,14 @@ func NewAuthHandler(app *fiber.App, usecase domain.AuthUseCase) {
 	group := app.Group("/api/v1/auth")
 	group.Post("/google", handler.LoginWithGoogle)
 	group.Post("/facebook", handler.LoginWithFacebook)
+	group.Post("/line", handler.LoginWithLine)
 	group.Post("/refresh", handler.RefreshToken)
 	group.Post("/otp/request", handler.RequestOTP)
 	group.Post("/otp/verify", handler.VerifyOTP)
 	group.Post("/register", handler.Register)
 	group.Post("/pin/login", handler.LoginWithPin)
+	group.Post("/bind-phone", handler.BindPhone)
+	group.Post("/check-phone", handler.CheckPhone)
 }
 
 func (h *AuthHandler) LoginWithGoogle(c fiber.Ctx) error {
@@ -51,6 +54,27 @@ func (h *AuthHandler) LoginWithFacebook(c fiber.Ctx) error {
 	}
 
 	res, err := h.usecase.LoginWithFacebook(req.AccessToken)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(res)
+}
+
+func (h *AuthHandler) LoginWithLine(c fiber.Ctx) error {
+	var req struct {
+		Code        string `json:"code"`
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	if req.Code == "" || req.RedirectURI == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "code and redirect_uri are required"})
+	}
+
+	res, err := h.usecase.LoginWithLine(req.Code, req.RedirectURI)
 	if err != nil {
 		return c.Status(401).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -144,4 +168,54 @@ func (h *AuthHandler) LoginWithPin(c fiber.Ctx) error {
 	}
 
 	return c.JSON(res)
+}
+
+func (h *AuthHandler) BindPhone(c fiber.Ctx) error {
+	var req struct {
+		IDToken     string `json:"id_token"`
+		PhoneNumber string `json:"phone_number"`
+		OTP         string `json:"otp"`
+		Ref         string `json:"ref"`
+		PIN         string `json:"pin"`
+		Provider    string `json:"provider"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	if req.IDToken == "" || req.PhoneNumber == "" || req.OTP == "" || req.Ref == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "id_token, phone_number, otp, and ref are required"})
+	}
+
+	provider := req.Provider
+	if provider == "" {
+		provider = "google"
+	}
+
+	res, err := h.usecase.BindPhone(provider, req.IDToken, req.PhoneNumber, req.OTP, req.Ref, req.PIN)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(res)
+}
+
+func (h *AuthHandler) CheckPhone(c fiber.Ctx) error {
+	var req struct {
+		PhoneNumber string `json:"phone_number"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	if req.PhoneNumber == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "phone_number is required"})
+	}
+
+	isRegistered, err := h.usecase.CheckPhone(req.PhoneNumber)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{"is_registered": isRegistered})
 }

@@ -75,6 +75,7 @@ type MeResponse struct {
 	LastName           string             `json:"last_name"`
 	Phone              string             `json:"phone"`
 	Email              *string            `json:"email,omitempty"`
+	Address            string             `json:"address,omitempty"`
 	ImageProfileUrl    *string            `json:"image_profile_url,omitempty"`
 	VerificationStatus string             `json:"verification_status"`
 	MenuItems          []MenuItemResponse `json:"menu_items"`

@@ -5,10 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math/big"
+	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -54,23 +57,34 @@ func (u *authUseCase) LoginWithGoogle(idToken string) (*domain.AuthResponse, err
 	name := payload.Claims["name"].(string)
 	picture := payload.Claims["picture"].(string)
 
+	claimsBytes, _ := json.Marshal(payload.Claims)
+	rawDataStr := string(claimsBytes)
+
 	user, err := u.repo.GetByProviderID("google", googleID)
 	if err != nil {
-
 		user, err = u.repo.GetByEmail(email)
 		if err != nil {
-
 			user = &domain.AppUser{
 				ID:              uuid.New(),
 				PhoneNumber:     "",
-				Provider:        stringPtr("google"),
-				ProviderId:      &googleID,
 				ImageProfileUrl: &picture,
 				IsConsent:       true,
 				CreatedBy:       "system",
 				CreatedDate:     time.Now(),
 				UpdatedBy:       "system",
 				UpdatedDate:     time.Now(),
+				OauthAccounts: []domain.UserOauthAccount{
+					{
+						ID:          uuid.New(),
+						Provider:    "google",
+						ProviderId:  googleID,
+						Email:       email,
+						DisplayName: name,
+						AvatarUrl:   picture,
+						RawData:     rawDataStr,
+						CreatedAt:   time.Now(),
+					},
+				},
 				Information: &domain.UserInformation{
 					Name:      name,
 					Email:     &email,
@@ -84,10 +98,22 @@ func (u *authUseCase) LoginWithGoogle(idToken string) (*domain.AuthResponse, err
 				return nil, err
 			}
 		} else {
-
-			user.Provider = stringPtr("google")
-			user.ProviderId = &googleID
-			u.repo.Update(user)
+			oauthAcc := &domain.UserOauthAccount{
+				ID:          uuid.New(),
+				UserId:      user.ID,
+				Provider:    "google",
+				ProviderId:  googleID,
+				Email:       email,
+				DisplayName: name,
+				AvatarUrl:   picture,
+				RawData:     rawDataStr,
+				CreatedAt:   time.Now(),
+			}
+			err = u.repo.CreateOauthAccount(oauthAcc)
+			if err != nil {
+				return nil, err
+			}
+			user.OauthAccounts = append(user.OauthAccounts, *oauthAcc)
 		}
 	}
 
@@ -109,7 +135,278 @@ func (u *authUseCase) LoginWithGoogle(idToken string) (*domain.AuthResponse, err
 }
 
 func (u *authUseCase) LoginWithFacebook(accessToken string) (*domain.AuthResponse, error) {
-	return nil, errors.New("facebook login not implemented yet")
+	// Call Facebook Graph API to verify token and retrieve profile info
+	resp, err := http.Get(fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", accessToken))
+	if err != nil {
+		return nil, fmt.Errorf("failed to call facebook api: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.New("invalid facebook token")
+	}
+
+	var fbProfile struct {
+		ID    string `json:"id"`
+		Name  string `json:"name"`
+		Email string `json:"email"`
+		Picture struct {
+			Data struct {
+				URL string `json:"url"`
+			} `json:"data"`
+		} `json:"picture"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&fbProfile); err != nil {
+		return nil, fmt.Errorf("failed to parse facebook response: %w", err)
+	}
+
+	if fbProfile.ID == "" {
+		return nil, errors.New("facebook profile id is empty")
+	}
+
+	// Fetch raw data to save
+	rawBytes, _ := json.Marshal(fbProfile)
+	rawDataStr := string(rawBytes)
+
+	picture := fbProfile.Picture.Data.URL
+
+	// 1. Check if user already has this Facebook account linked
+	user, err := u.repo.GetByProviderID("facebook", fbProfile.ID)
+	if err != nil {
+		// Not found by provider, try finding by email if it exists
+		if fbProfile.Email != "" {
+			user, err = u.repo.GetByEmail(fbProfile.Email)
+		}
+
+		if err != nil || user == nil {
+			// Create a brand new user
+			newUserID := uuid.New()
+			firstName := fbProfile.Name
+			lastName := ""
+			for i, char := range fbProfile.Name {
+				if char == ' ' {
+					firstName = fbProfile.Name[:i]
+					lastName = fbProfile.Name[i+1:]
+					break
+				}
+			}
+
+			user = &domain.AppUser{
+				ID:              newUserID,
+				PhoneNumber:     "",
+				ImageProfileUrl: &picture,
+				IsConsent:       true,
+				CreatedBy:       "system",
+				CreatedDate:     time.Now(),
+				UpdatedBy:       "system",
+				UpdatedDate:     time.Now(),
+				OauthAccounts: []domain.UserOauthAccount{
+					{
+						ID:          uuid.New(),
+						Provider:    "facebook",
+						ProviderId:  fbProfile.ID,
+						Email:       fbProfile.Email,
+						DisplayName: fbProfile.Name,
+						AvatarUrl:   picture,
+						RawData:     rawDataStr,
+						CreatedAt:   time.Now(),
+					},
+				},
+				Information: &domain.UserInformation{
+					UserId:             newUserID,
+					Name:               firstName,
+					LastName:           lastName,
+					Phone:              "",
+					Status:             "active",
+					VerificationStatus: "unverified",
+					IsConsent:          true,
+					CreatedBy:          "system",
+					CreatedDate:        time.Now(),
+					UpdatedDate:        time.Now(),
+				},
+			}
+			if fbProfile.Email != "" {
+				user.Email = &fbProfile.Email
+				user.Information.Email = &fbProfile.Email
+			}
+
+			err = u.repo.Create(user)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// Bind Facebook provider to existing user
+			oauthAcc := &domain.UserOauthAccount{
+				ID:          uuid.New(),
+				UserId:      user.ID,
+				Provider:    "facebook",
+				ProviderId:  fbProfile.ID,
+				Email:       fbProfile.Email,
+				DisplayName: fbProfile.Name,
+				AvatarUrl:   picture,
+				RawData:     rawDataStr,
+				CreatedAt:   time.Now(),
+			}
+			err = u.repo.CreateOauthAccount(oauthAcc)
+			if err != nil {
+				return nil, err
+			}
+			user.OauthAccounts = append(user.OauthAccounts, *oauthAcc)
+		}
+	}
+
+	accessTokenJWT, err := u.generateAccessToken(user)
+	if err != nil {
+		return nil, err
+	}
+
+	refreshTokenJWT, err := u.generateRefreshToken(user)
+	if err != nil {
+		return nil, err
+	}
+
+	return &domain.AuthResponse{
+		AccessToken:  accessTokenJWT,
+		RefreshToken: refreshTokenJWT,
+		User:         user,
+	}, nil
+}
+
+func (u *authUseCase) LoginWithLine(code string, redirectURI string) (*domain.AuthResponse, error) {
+	// 1. Exchange Authorization Code for Access Token
+	tokenData := url.Values{}
+	tokenData.Set("grant_type", "authorization_code")
+	tokenData.Set("code", code)
+	tokenData.Set("redirect_uri", redirectURI)
+	tokenData.Set("client_id", u.config.LineChannelID)
+	tokenData.Set("client_secret", u.config.LineChannelSecret)
+
+	tokenResp, err := http.PostForm("https://api.line.me/oauth2/v2.1/token", tokenData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to call line token api: %w", err)
+	}
+	defer tokenResp.Body.Close()
+
+	if tokenResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("invalid line auth code or secret (status %d)", tokenResp.StatusCode)
+	}
+
+	var tokenResult struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err != nil {
+		return nil, fmt.Errorf("failed to parse line token response: %w", err)
+	}
+
+	if tokenResult.AccessToken == "" {
+		return nil, errors.New("line access token is empty")
+	}
+
+	// 2. Fetch User Profile using Access Token
+	req, err := http.NewRequest(http.MethodGet, "https://api.line.me/v2/profile", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create profile request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", tokenResult.AccessToken))
+
+	profileResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch line profile: %w", err)
+	}
+	defer profileResp.Body.Close()
+
+	if profileResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to verify line token with profile api (status %d)", profileResp.StatusCode)
+	}
+
+	var lineProfile struct {
+		UserID      string `json:"userId"`
+		DisplayName string `json:"displayName"`
+		PictureURL  string `json:"pictureUrl"`
+	}
+	if err := json.NewDecoder(profileResp.Body).Decode(&lineProfile); err != nil {
+		return nil, fmt.Errorf("failed to parse line profile response: %w", err)
+	}
+
+	if lineProfile.UserID == "" {
+		return nil, errors.New("line user id is empty")
+	}
+
+	// Fetch raw data to save
+	rawBytes, _ := json.Marshal(lineProfile)
+	rawDataStr := string(rawBytes)
+
+	// 3. Match / Register user
+	user, err := u.repo.GetByProviderID("line", lineProfile.UserID)
+	if err != nil {
+		// Create a brand new user
+		newUserID := uuid.New()
+		firstName := lineProfile.DisplayName
+		lastName := ""
+		for i, char := range lineProfile.DisplayName {
+			if char == ' ' {
+				firstName = lineProfile.DisplayName[:i]
+				lastName = lineProfile.DisplayName[i+1:]
+				break
+			}
+		}
+
+		user = &domain.AppUser{
+			ID:              newUserID,
+			PhoneNumber:     "",
+			ImageProfileUrl: &lineProfile.PictureURL,
+			IsConsent:       true,
+			CreatedBy:       "system",
+			CreatedDate:     time.Now(),
+			UpdatedBy:       "system",
+			UpdatedDate:     time.Now(),
+			OauthAccounts: []domain.UserOauthAccount{
+				{
+					ID:          uuid.New(),
+					Provider:    "line",
+					ProviderId:  lineProfile.UserID,
+					DisplayName: lineProfile.DisplayName,
+					AvatarUrl:   lineProfile.PictureURL,
+					RawData:     rawDataStr,
+					CreatedAt:   time.Now(),
+				},
+			},
+			Information: &domain.UserInformation{
+				UserId:             newUserID,
+				Name:               firstName,
+				LastName:           lastName,
+				Phone:              "",
+				Status:             "active",
+				VerificationStatus: "unverified",
+				IsConsent:          true,
+				CreatedBy:          "system",
+				CreatedDate:        time.Now(),
+				UpdatedDate:        time.Now(),
+			},
+		}
+
+		err = u.repo.Create(user)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	accessTokenJWT, err := u.generateAccessToken(user)
+	if err != nil {
+		return nil, err
+	}
+
+	refreshTokenJWT, err := u.generateRefreshToken(user)
+	if err != nil {
+		return nil, err
+	}
+
+	return &domain.AuthResponse{
+		AccessToken:  accessTokenJWT,
+		RefreshToken: refreshTokenJWT,
+		User:         user,
+	}, nil
 }
 
 func (u *authUseCase) RefreshToken(refreshToken string) (*domain.AuthResponse, error) {
@@ -352,4 +649,167 @@ func hashValue(v string) string {
 	h := sha256.New()
 	h.Write([]byte(v))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin string) (*domain.AuthResponse, error) {
+	// 1. ตรวจสอบรหัส OTP และ Ref Code
+	u.otpMu.Lock()
+	stored, exists := u.otpStore[phoneNumber]
+	if exists {
+		delete(u.otpStore, phoneNumber)
+	}
+	u.otpMu.Unlock()
+
+	if !exists {
+		return nil, errors.New("OTP verification code not found or expired")
+	}
+
+	if time.Now().After(stored.ExpiresAt) {
+		return nil, errors.New("OTP code has expired")
+	}
+
+	if stored.Code != otp || stored.Ref != ref {
+		return nil, errors.New("invalid OTP code or reference")
+	}
+
+	// 2. ตรวจสอบ JWT Token เพื่อเอา oauthID จาก Provider
+	var oauthID string
+	if provider == "facebook" {
+		// Call Facebook Graph API to get Facebook ID
+		resp, err := http.Get(fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id&access_token=%s", idToken))
+		if err != nil {
+			return nil, fmt.Errorf("failed to call facebook api: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, errors.New("invalid facebook token")
+		}
+
+		var fbProfile struct {
+			ID string `json:"id"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&fbProfile); err != nil {
+			return nil, fmt.Errorf("failed to parse facebook response: %w", err)
+		}
+		if fbProfile.ID == "" {
+			return nil, errors.New("facebook profile id is empty")
+		}
+		oauthID = fbProfile.ID
+	} else {
+		// Google Validation
+		payload, err := idtoken.Validate(context.Background(), idToken, u.config.GoogleClientID)
+		if err != nil {
+			return nil, errors.New("invalid google token")
+		}
+		oauthID = payload.Subject
+	}
+
+	// ค้นหาบัญชีชั่วคราวจาก oauthID
+	tempUser, err := u.repo.GetByProviderID(provider, oauthID)
+	if err != nil {
+		return nil, fmt.Errorf("temporary %s user not found", provider)
+	}
+
+	// ค้นหาว่าเบอร์โทรศัพท์นี้มีอยู่ในระบบแล้วหรือยัง
+	existingUser, err := u.repo.GetByPhoneNumber(phoneNumber)
+	if err != nil {
+		// กรณีที่ 1: ยังไม่มีเบอร์นี้ในระบบ (อัปเดตลงบัญชีชั่วคราว)
+		tempUser.PhoneNumber = phoneNumber
+		tempUser.PhoneNumberHash = hashValue(phoneNumber)
+		tempUser.UpdatedDate = time.Now()
+
+		if pin != "" {
+			hashedPin, err := bcrypt.GenerateFromPassword([]byte(pin), bcrypt.DefaultCost)
+			if err != nil {
+				return nil, fmt.Errorf("failed to hash pin: %w", err)
+			}
+			tempUser.PinHash = string(hashedPin)
+		}
+
+		if tempUser.Information != nil {
+			tempUser.Information.Name = "ผู้ใช้ชลบุรีพลัส"
+			tempUser.Information.LastName = fmt.Sprintf("เบอร์ %s", phoneNumber[len(phoneNumber)-4:])
+			tempUser.Information.Phone = phoneNumber
+			tempUser.Information.UpdatedDate = time.Now()
+		}
+
+		err = u.repo.Update(tempUser)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update user: %w", err)
+		}
+
+		accessToken, err := u.generateAccessToken(tempUser)
+		if err != nil {
+			return nil, err
+		}
+
+		refreshToken, err := u.generateRefreshToken(tempUser)
+		if err != nil {
+			return nil, err
+		}
+
+		return &domain.AuthResponse{
+			AccessToken:  accessToken,
+			RefreshToken: refreshToken,
+			User:         tempUser,
+		}, nil
+	}
+
+	// กรณีที่ 2: เจอเบอร์ในระบบอยู่แล้ว (บัญชีเดิม)
+	// ค้นหา OAuth Account จากบัญชีชั่วคราว
+	var oauthAcc *domain.UserOauthAccount
+	for i := range tempUser.OauthAccounts {
+		if tempUser.OauthAccounts[i].Provider == provider && tempUser.OauthAccounts[i].ProviderId == oauthID {
+			oauthAcc = &tempUser.OauthAccounts[i]
+			break
+		}
+	}
+
+	if oauthAcc == nil {
+		return nil, fmt.Errorf("%s oauth account not found on temporary user", provider)
+	}
+
+	// ผูก Oauth Account นี้เข้ากับบัญชีเดิม
+	oauthAcc.UserId = existingUser.ID
+	err = u.repo.UpdateOauthAccount(oauthAcc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update oauth account: %w", err)
+	}
+
+	// ลบบัญชีชั่วคราวออก
+	err = u.repo.Delete(tempUser)
+	if err != nil {
+		return nil, fmt.Errorf("failed to delete temporary user: %w", err)
+	}
+
+	// โหลดบัญชีเดิมตัวล่าสุดที่รวมบัญชีเรียบร้อยแล้ว
+	updatedExistingUser, err := u.repo.GetByID(existingUser.ID)
+	if err != nil {
+		updatedExistingUser = existingUser
+	}
+
+	accessToken, err := u.generateAccessToken(updatedExistingUser)
+	if err != nil {
+		return nil, err
+	}
+
+	refreshToken, err := u.generateRefreshToken(updatedExistingUser)
+	if err != nil {
+		return nil, err
+	}
+
+	return &domain.AuthResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		User:         updatedExistingUser,
+	}, nil
+}
+
+func (u *authUseCase) CheckPhone(phoneNumber string) (bool, error) {
+	_, err := u.repo.GetByPhoneNumber(phoneNumber)
+	if err != nil {
+		return false, nil
+	}
+	return true, nil
 }
