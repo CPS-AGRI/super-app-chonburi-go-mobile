@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"errors"
+	"fmt"
 
 	"super-app-chonburi-go-mobile/internal/domain"
 
@@ -14,6 +15,62 @@ type verificationUseCase struct {
 
 func NewVerificationUseCase(repo domain.VerificationRepository) domain.VerificationUseCase {
 	return &verificationUseCase{repo: repo}
+}
+
+func formatThaiAddress(info *domain.UserInformation) string {
+	if info == nil {
+		return ""
+	}
+	var addr string
+	if info.HouseNumber != "" {
+		addr += info.HouseNumber
+	}
+	if info.BuildingName != "" {
+		addr += " อาคาร " + info.BuildingName
+	}
+	if info.RoomNumber != "" {
+		addr += " ห้อง " + info.RoomNumber
+	}
+	if info.VillageNumber != "" && info.VillageNumber != "-" {
+		addr += " หมู่ " + info.VillageNumber
+	}
+	if info.Alley != "" && info.Alley != "-" {
+		addr += " ซอย" + info.Alley
+	}
+	if info.Intersection != "" && info.Intersection != "-" {
+		addr += " แยก " + info.Intersection
+	}
+	if info.Road != "" && info.Road != "-" {
+		addr += " ถนน" + info.Road
+	}
+	
+	isBkk := info.Province == "กรุงเทพมหานคร" || info.Province == "กรุงเทพฯ"
+	
+	if info.Subdistrict != "" {
+		if isBkk {
+			addr += " แขวง" + info.Subdistrict
+		} else {
+			addr += " ต." + info.Subdistrict
+		}
+	}
+	if info.District != "" {
+		if isBkk {
+			addr += " เขต" + info.District
+		} else {
+			addr += " อ." + info.District
+		}
+	}
+	if info.Province != "" {
+		if isBkk {
+			addr += " " + info.Province
+		} else {
+			addr += " จ." + info.Province
+		}
+	}
+	if info.PostalCode > 0 {
+		addr += fmt.Sprintf(" %d", info.PostalCode)
+	}
+	return addr
 }
 
 func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error) {
@@ -30,6 +87,7 @@ func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error
 	verificationStatus := "unverified"
 	var name, lastName, phone string
 	var email *string
+	var address string
 
 	if user.Information != nil {
 		verificationStatus = user.Information.VerificationStatus
@@ -37,6 +95,9 @@ func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error
 		lastName = user.Information.LastName
 		phone = user.Information.Phone
 		email = user.Information.Email
+		if verificationStatus == "verified" {
+			address = formatThaiAddress(user.Information)
+		}
 	} else {
 		name = "User"
 		phone = user.PhoneNumber
@@ -70,6 +131,7 @@ func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error
 		LastName:           lastName,
 		Phone:              phone,
 		Email:              email,
+		Address:            address,
 		ImageProfileUrl:    user.ImageProfileUrl,
 		VerificationStatus: verificationStatus,
 		MenuItems:          menuItems,

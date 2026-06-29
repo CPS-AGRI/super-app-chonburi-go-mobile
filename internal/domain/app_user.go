@@ -14,24 +14,39 @@ const (
 	AppUserStatusInactive AppUserStatus = "inactive"
 )
 
+type UserOauthAccount struct {
+	ID          uuid.UUID `gorm:"type:uuid;primaryKey;default:uuid_generate_v4();column:id" json:"id"`
+	UserId      uuid.UUID `gorm:"type:uuid;not null;column:user_id" json:"user_id"`
+	Provider    string    `gorm:"type:text;not null;column:provider" json:"provider"` // google, facebook, line, apple
+	ProviderId  string    `gorm:"type:text;not null;column:provider_id" json:"provider_id"`
+	Email       string    `gorm:"type:text;column:email" json:"email"`
+	DisplayName string    `gorm:"type:text;column:display_name" json:"display_name"`
+	AvatarUrl   string    `gorm:"type:text;column:avatar_url" json:"avatar_url"`
+	RawData     string    `gorm:"type:jsonb;column:raw_data" json:"raw_data"`
+	CreatedAt   time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:created_at" json:"created_at"`
+}
+
+func (UserOauthAccount) TableName() string {
+	return "user_oauth_accounts"
+}
+
 type AppUser struct {
-	ID              uuid.UUID `gorm:"type:uuid;primaryKey;default:uuid_generate_v4();column:id" json:"id"`
-	PhoneNumber     string    `gorm:"type:text;not null;column:phone_number" json:"phone_number"`
-	PhoneNumberHash string    `gorm:"type:text;index;column:phone_number_hash" json:"-"`
-	PinHash         string    `gorm:"type:text;not null;column:pin_hash" json:"-"`
-	IsConsent       bool      `gorm:"not null;default:false;column:is_consent" json:"is_consent"`
-	ImageProfileUrl *string   `gorm:"type:text;column:image_profile_url" json:"image_profile_url"`
-	Provider        *string   `gorm:"type:text;column:provider" json:"provider"`
-	ProviderId      *string   `gorm:"type:text;column:provider_id" json:"provider_id"`
-	Email           *string   `gorm:"type:text;column:email" json:"email"`
-	EmailHash       *string   `gorm:"type:text;index;column:email_hash" json:"-"`
+	ID              uuid.UUID          `gorm:"type:uuid;primaryKey;default:uuid_generate_v4();column:id" json:"id"`
+	PhoneNumber     string             `gorm:"type:text;not null;column:phone_number" json:"phone_number"`
+	PhoneNumberHash string             `gorm:"type:text;index;column:phone_number_hash" json:"-"`
+	PinHash         string             `gorm:"type:text;not null;column:pin_hash" json:"-"`
+	IsConsent       bool               `gorm:"not null;default:false;column:is_consent" json:"is_consent"`
+	ImageProfileUrl *string            `gorm:"type:text;column:image_profile_url" json:"image_profile_url"`
+	Email           *string            `gorm:"type:text;column:email" json:"email"`
+	EmailHash       *string            `gorm:"type:text;index;column:email_hash" json:"-"`
 
 	CreatedBy   string    `gorm:"type:text;not null;default:'';column:created_by" json:"created_by"`
 	CreatedDate time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:created_date" json:"created_date"`
 	UpdatedBy   string    `gorm:"type:text;not null;default:'';column:updated_by" json:"updated_by"`
 	UpdatedDate time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:updated_date" json:"updated_date"`
 
-	Information *UserInformation `gorm:"foreignKey:UserId;constraint:OnUpdate:CASCADE,OnDelete:CASCADE;" json:"information,omitempty"`
+	OauthAccounts []UserOauthAccount `gorm:"foreignKey:UserId;constraint:OnUpdate:CASCADE,OnDelete:CASCADE;" json:"oauth_accounts,omitempty"`
+	Information   *UserInformation   `gorm:"foreignKey:UserId;constraint:OnUpdate:CASCADE,OnDelete:CASCADE;" json:"information,omitempty"`
 }
 
 func (AppUser) TableName() string {
@@ -91,11 +106,15 @@ func (UserInformation) TableName() string {
 }
 
 type AuthRepository interface {
+	GetByID(id uuid.UUID) (*AppUser, error)
 	GetByProviderID(provider, providerID string) (*AppUser, error)
 	GetByEmail(email string) (*AppUser, error)
 	GetByPhoneNumber(phoneNumber string) (*AppUser, error)
 	Create(user *AppUser) error
 	Update(user *AppUser) error
+	CreateOauthAccount(oauth *UserOauthAccount) error
+	UpdateOauthAccount(oauth *UserOauthAccount) error
+	Delete(user *AppUser) error
 }
 
 type OTPRequest struct {
@@ -133,11 +152,14 @@ type PinLoginRequest struct {
 type AuthUseCase interface {
 	LoginWithGoogle(idToken string) (*AuthResponse, error)
 	LoginWithFacebook(accessToken string) (*AuthResponse, error)
+	LoginWithLine(code string, redirectURI string) (*AuthResponse, error)
 	RefreshToken(refreshToken string) (*AuthResponse, error)
 	RequestOTP(phoneNumber string) (*OTPRequestResponse, error)
 	VerifyOTP(phoneNumber, otp, ref string) (*OTPVerifyResponse, error)
 	Register(pin, tempToken string) (*AuthResponse, error)
 	LoginWithPin(phoneNumber, pin string) (*AuthResponse, error)
+	BindPhone(provider, idToken, phoneNumber, otp, ref, pin string) (*AuthResponse, error)
+	CheckPhone(phoneNumber string) (bool, error)
 }
 
 type AuthResponse struct {

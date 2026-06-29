@@ -18,6 +18,8 @@ type Config struct {
 	GoogleClientSecret string
 	FacebookAppID      string
 	FacebookAppSecret  string
+	LineChannelID      string
+	LineChannelSecret  string
 
 	SMTPHost     string
 	SMTPPort     string
@@ -116,6 +118,8 @@ func LoadConfig() *Config {
 		GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
 		FacebookAppID:      os.Getenv("FACEBOOK_APP_ID"),
 		FacebookAppSecret:  os.Getenv("FACEBOOK_APP_SECRET"),
+		LineChannelID:      os.Getenv("LINE_CHANNEL_ID"),
+		LineChannelSecret:  os.Getenv("LINE_CHANNEL_SECRET"),
 		SMTPHost:           os.Getenv("SMTP_HOST"),
 		SMTPPort:           os.Getenv("SMTP_PORT"),
 		SMTPEmail:          os.Getenv("SMTP_EMAIL"),
