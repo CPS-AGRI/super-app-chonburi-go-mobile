@@ -1,6 +1,8 @@
 package http
 
 import (
+	"fmt"
+
 	"github.com/gofiber/fiber/v3"
 	"super-app-chonburi-go-mobile/internal/domain"
 )
@@ -16,6 +18,8 @@ func NewAuthHandler(app *fiber.App, usecase domain.AuthUseCase) {
 	group.Post("/google", handler.LoginWithGoogle)
 	group.Post("/facebook", handler.LoginWithFacebook)
 	group.Post("/line", handler.LoginWithLine)
+	group.Post("/thaiid", handler.LoginWithThaiID)
+	group.Get("/thaiid/callback", handler.ThaiIDCallback)
 	group.Post("/refresh", handler.RefreshToken)
 	group.Post("/otp/request", handler.RequestOTP)
 	group.Post("/otp/verify", handler.VerifyOTP)
@@ -80,6 +84,39 @@ func (h *AuthHandler) LoginWithLine(c fiber.Ctx) error {
 	}
 
 	return c.JSON(res)
+}
+
+func (h *AuthHandler) LoginWithThaiID(c fiber.Ctx) error {
+	var req struct {
+		Code        string `json:"code"`
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	if req.Code == "" || req.RedirectURI == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "code and redirect_uri are required"})
+	}
+
+	res, err := h.usecase.LoginWithThaiID(req.Code, req.RedirectURI)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(res)
+}
+
+func (h *AuthHandler) ThaiIDCallback(c fiber.Ctx) error {
+	code := c.Query("code")
+	state := c.Query("state")
+
+	if code == "" {
+		return c.Status(400).SendString("Authorization code is missing")
+	}
+
+	redirectURL := fmt.Sprintf("chonburiplus://thaiid?code=%s&state=%s", code, state)
+	return c.Redirect().Status(fiber.StatusFound).To(redirectURL)
 }
 
 func (h *AuthHandler) RefreshToken(c fiber.Ctx) error {
