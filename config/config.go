@@ -21,6 +21,11 @@ type Config struct {
 	LineChannelID      string
 	LineChannelSecret  string
 
+	ThaiIDClientID     string
+	ThaiIDClientSecret string
+	ThaiIDApiKey       string
+	ThaiIDRedirectURI  string
+
 	SMTPHost     string
 	SMTPPort     string
 	SMTPEmail    string
@@ -120,6 +125,10 @@ func LoadConfig() *Config {
 		FacebookAppSecret:  os.Getenv("FACEBOOK_APP_SECRET"),
 		LineChannelID:      os.Getenv("LINE_CHANNEL_ID"),
 		LineChannelSecret:  os.Getenv("LINE_CHANNEL_SECRET"),
+		ThaiIDClientID:     os.Getenv("THAIID_CLIENT_ID"),
+		ThaiIDClientSecret: os.Getenv("THAIID_CLIENT_SECRET"),
+		ThaiIDApiKey:       os.Getenv("THAIID_API_KEY"),
+		ThaiIDRedirectURI:  os.Getenv("THAIID_REDIRECT_URI"),
 		SMTPHost:           os.Getenv("SMTP_HOST"),
 		SMTPPort:           os.Getenv("SMTP_PORT"),
 		SMTPEmail:          os.Getenv("SMTP_EMAIL"),

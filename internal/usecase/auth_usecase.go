@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -392,6 +394,220 @@ func (u *authUseCase) LoginWithLine(code string, redirectURI string) (*domain.Au
 		}
 	}
 
+	accessTokenJWT, err := u.generateAccessToken(user)
+	if err != nil {
+		return nil, err
+	}
+
+	refreshTokenJWT, err := u.generateRefreshToken(user)
+	if err != nil {
+		return nil, err
+	}
+
+	return &domain.AuthResponse{
+		AccessToken:  accessTokenJWT,
+		RefreshToken: refreshTokenJWT,
+		User:         user,
+	}, nil
+}
+
+func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.AuthResponse, error) {
+	// 1. Exchange Authorization Code for Access Token
+	tokenURL := "https://imauthsbx.bora.dopa.go.th/api/v2/oauth2/token/"
+	data := url.Values{}
+	data.Set("grant_type", "authorization_code")
+	data.Set("code", code)
+	data.Set("redirect_uri", redirectURI)
+
+	reqToken, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create token request: %w", err)
+	}
+
+	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", u.config.ThaiIDClientID, u.config.ThaiIDClientSecret)))
+	reqToken.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	reqToken.Header.Set("Authorization", fmt.Sprintf("Basic %s", basicAuth))
+	reqToken.Header.Set("x-api-key", u.config.ThaiIDApiKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	respToken, err := client.Do(reqToken)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute token request: %w", err)
+	}
+	defer respToken.Body.Close()
+
+	if respToken.StatusCode != http.StatusOK {
+		var errData map[string]interface{}
+		_ = json.NewDecoder(respToken.Body).Decode(&errData)
+		return nil, fmt.Errorf("token exchange failed with status %d: %v", respToken.StatusCode, errData)
+	}
+
+	var tokenResult struct {
+		AccessToken string `json:"access_token"`
+	}
+	if err := json.NewDecoder(respToken.Body).Decode(&tokenResult); err != nil {
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	if tokenResult.AccessToken == "" {
+		return nil, errors.New("thaiid access token is empty")
+	}
+
+	// 2. Fetch UserInfo profile using Access Token
+	userInfoURL := "https://imauthsbx.bora.dopa.go.th/api/v2/oauth2/userinfo/"
+	reqProfile, err := http.NewRequest(http.MethodGet, userInfoURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create userinfo request: %w", err)
+	}
+	reqProfile.Header.Set("Authorization", fmt.Sprintf("Bearer %s", tokenResult.AccessToken))
+	reqProfile.Header.Set("x-api-key", u.config.ThaiIDApiKey)
+
+	respProfile, err := client.Do(reqProfile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute userinfo request: %w", err)
+	}
+	defer respProfile.Body.Close()
+
+	if respProfile.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch user info (status %d)", respProfile.StatusCode)
+	}
+
+	var thaiIDProfile map[string]interface{}
+	if err := json.NewDecoder(respProfile.Body).Decode(&thaiIDProfile); err != nil {
+		return nil, fmt.Errorf("failed to decode userinfo response: %w", err)
+	}
+
+	pid, _ := thaiIDProfile["pid"].(string)
+	if pid == "" {
+		return nil, errors.New("pid is empty in userinfo response")
+	}
+
+	// Marshal raw profile data to save in UserOauthAccount
+	rawBytes, _ := json.Marshal(thaiIDProfile)
+	rawDataStr := string(rawBytes)
+
+	// 3. Match or register user based on pid
+	user, err := u.repo.GetByProviderID("thaiid", pid)
+	if err != nil {
+		// Not found: Create a brand new user
+		newUserID := uuid.New()
+		givenName, _ := thaiIDProfile["given_name"].(string)
+		familyName, _ := thaiIDProfile["family_name"].(string)
+		displayName, _ := thaiIDProfile["name"].(string)
+		if displayName == "" {
+			displayName = givenName + " " + familyName
+		}
+		title, _ := thaiIDProfile["titleTh"].(string)
+		if title == "" {
+			title, _ = thaiIDProfile["title"].(string)
+		}
+
+		// Parse birthdate
+		var birthday *time.Time
+		if birthdateStr, ok := thaiIDProfile["birthdate"].(string); ok && birthdateStr != "" {
+			if t, err := time.Parse("2006-01-02", birthdateStr); err == nil {
+				birthday = &t
+			}
+		}
+
+		// Parse card expiry
+		var idCardExpiry *time.Time
+		if expiryStr, ok := thaiIDProfile["date_of_expiry"].(string); ok && expiryStr != "" {
+			if t, err := time.Parse("2006-01-02", expiryStr); err == nil {
+				idCardExpiry = &t
+			}
+		}
+
+		// Parse address from house_address or address
+		var houseNumber, villageNumber, alley, road, subdistrict, district, province string
+		if houseAddrMap, ok := thaiIDProfile["house_address"].(map[string]interface{}); ok {
+			if rawAddr, ok := houseAddrMap["raw"].(string); ok && rawAddr != "" {
+				parts := strings.Split(rawAddr, "#")
+				if len(parts) > 0 { houseNumber = parts[0] }
+				if len(parts) > 1 { villageNumber = parts[1] }
+				if len(parts) > 2 { alley = parts[2] }
+				if len(parts) > 3 && parts[3] != "" {
+					if alley == "" {
+						alley = parts[3]
+					} else {
+						alley = alley + " " + parts[3]
+					}
+				}
+				if len(parts) > 4 { road = parts[4] }
+				if len(parts) > 5 { subdistrict = parts[5] }
+				if len(parts) > 6 { district = parts[6] }
+				if len(parts) > 7 { province = parts[7] }
+			}
+		} else if addrMap, ok := thaiIDProfile["address"].(map[string]interface{}); ok {
+			if formattedAddr, ok := addrMap["formatted"].(string); ok {
+				subdistrict = formattedAddr
+			}
+		} else if addrStr, ok := thaiIDProfile["address"].(string); ok && addrStr != "" {
+			subdistrict = addrStr
+		}
+
+		// Encrypt and hash identity number (PID)
+		h := sha256.New()
+		h.Write([]byte(pid))
+		identityHash := hex.EncodeToString(h.Sum(nil))
+		identityEncrypted := "ENC_" + pid
+
+		idCardTypeVal := 1
+
+		user = &domain.AppUser{
+			ID:              newUserID,
+			PhoneNumber:     "", // OAuth registration registers phone later or leaves empty
+			IsConsent:       true,
+			CreatedBy:       "system",
+			CreatedDate:     time.Now(),
+			UpdatedBy:       "system",
+			UpdatedDate:     time.Now(),
+			OauthAccounts: []domain.UserOauthAccount{
+				{
+					ID:          uuid.New(),
+					UserId:      newUserID,
+					Provider:    "thaiid",
+					ProviderId:  pid,
+					DisplayName: displayName,
+					RawData:     rawDataStr,
+					CreatedAt:   time.Now(),
+				},
+			},
+			Information: &domain.UserInformation{
+				UserId:                  newUserID,
+				Prefix:                  title,
+				Name:                    givenName,
+				LastName:                familyName,
+				Phone:                   "",
+				Birthday:                birthday,
+				IdentityNumberEncrypted: identityEncrypted,
+				IdentityNumberHash:      identityHash,
+				IdCardType:              &idCardTypeVal,
+				IdCardExpiry:            idCardExpiry,
+				Status:                  "active",
+				VerificationStatus:      "verified", // Verified automatically by ThaiID
+				VerifiedDate:            func() *time.Time { t := time.Now(); return &t }(),
+				HouseNumber:             houseNumber,
+				VillageNumber:           villageNumber,
+				Alley:                   alley,
+				Road:                    road,
+				Subdistrict:             subdistrict,
+				District:                district,
+				Province:                province,
+				IsConsent:               true,
+				CreatedBy:               "system",
+				CreatedDate:             time.Now(),
+				UpdatedDate:             time.Now(),
+			},
+		}
+
+		err = u.repo.Create(user)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// 4. Generate system access and refresh tokens
 	accessTokenJWT, err := u.generateAccessToken(user)
 	if err != nil {
 		return nil, err
