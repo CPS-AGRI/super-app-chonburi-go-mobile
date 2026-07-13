@@ -5,7 +5,13 @@ import (
 	"time"
 
 	"super-app-chonburi-go-mobile/config"
+	"super-app-chonburi-go-mobile/internal/delivery/http"
+	"super-app-chonburi-go-mobile/internal/repository"
+	"super-app-chonburi-go-mobile/internal/usecase"
 	"super-app-chonburi-go-mobile/pkg/database"
+	"super-app-chonburi-go-mobile/pkg/mail"
+	"super-app-chonburi-go-mobile/pkg/storage"
+	minioStorage "super-app-chonburi-go-mobile/pkg/storage/minio"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/compress"
@@ -20,8 +26,14 @@ func main() {
 
 	database.ConnectDB(cfg)
 
+	minioClient, err := minioStorage.NewClient(cfg.MinIO)
+	if err != nil {
+		log.Fatalf("Fatal: Failed to initialize MinIO client: %v", err)
+	}
+
 	app := fiber.New(fiber.Config{
 		AppName:      "Super App Chonburi Mobile API",
+		BodyLimit:    100 * 1024 * 1024,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,
@@ -40,8 +52,43 @@ func main() {
 		AllowCredentials: false,
 	}))
 
-	api := app.Group("/api/v1")
-	_ = api // TODO: register routes here
+	authRepo := repository.NewAuthRepository(database.DB)
+	authUseCase := usecase.NewAuthUseCase(authRepo, cfg)
+	http.NewAuthHandler(app, authUseCase)
+
+	complaintRepo := repository.NewComplaintRepository(database.DB)
+	complaintUseCase := usecase.NewComplaintUseCase(complaintRepo)
+	http.NewComplaintHandler(app, complaintUseCase, cfg)
+
+	moduleRepo := repository.NewModuleRepository(database.DB)
+	moduleUseCase := usecase.NewModuleUseCase(moduleRepo)
+	http.NewModuleHandler(app, moduleUseCase)
+
+	mailSender := mail.NewSMTPEmailSender(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPEmail, cfg.SMTPPassword)
+	uploadStorage := storage.NewMinIOStorage(minioClient)
+	taxNewMobileRepo := repository.NewTaxNewMobileRepository(database.DB)
+	taxNewMobileUseCase := usecase.NewTaxNewMobileUseCase(taxNewMobileRepo, mailSender, cfg.TaxBillerID)
+	http.NewTaxNewMobileHandler(app, taxNewMobileUseCase, uploadStorage)
+
+	muniBankRepo := repository.NewMunicipalityBankRepository(database.DB)
+	muniBankUseCase := usecase.NewMunicipalityBankUseCase(muniBankRepo)
+	http.NewMunicipalityBankHandler(app, muniBankUseCase)
+
+	publicRelationRepo := repository.NewPublicRelationMobileRepository(database.DB)
+	publicRelationUseCase := usecase.NewPublicRelationMobileUseCase(publicRelationRepo)
+	http.NewPublicRelationMobileHandler(app, publicRelationUseCase)
+
+	notificationRepo := repository.NewNotificationRepository(database.DB)
+	notificationUseCase := usecase.NewNotificationUseCase(notificationRepo)
+	http.NewNotificationHandler(app, notificationUseCase, cfg)
+
+	verificationRepo := repository.NewVerificationRepository(database.DB)
+	verificationUseCase := usecase.NewVerificationUseCase(verificationRepo)
+	http.NewVerificationHandler(app, verificationUseCase, cfg)
+
+	cctvRepo := repository.NewCCTVRepository(database.DB)
+	cctvUseCase := usecase.NewCCTVUseCase(cctvRepo)
+	http.NewCCTVHandler(app, cctvUseCase, cfg)
 
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")
