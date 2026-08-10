@@ -34,6 +34,11 @@ type Config struct {
 	TaxBillerID  string
 	TaxUploadDir string
 	MinIO        MinIOConfig
+
+	SMSGatewayURL string
+	SMSAPIKey     string
+	SMSAPISecret  string
+	SMSSenderName string
 }
 
 type MinIOConfig struct {
@@ -147,6 +152,10 @@ func LoadConfig() *Config {
 			PresignURLTTL:   minioPresignURLTTL,
 			MaxUploadSizeMB: minioMaxUploadSizeMB,
 		},
+		SMSGatewayURL: os.Getenv("SMS_GATEWAY_URL"),
+		SMSAPIKey:     os.Getenv("SMS_API_KEY"),
+		SMSAPISecret:  os.Getenv("SMS_API_SECRET"),
+		SMSSenderName: os.Getenv("SMS_SENDER_NAME"),
 	}
 }
 

@@ -181,7 +181,7 @@ func (h *AuthHandler) Register(c fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "pin and temp_token are required"})
 	}
 
-	res, err := h.usecase.Register(req.Pin, req.TempToken)
+	res, err := h.usecase.Register(req)
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 	}

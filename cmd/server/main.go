@@ -6,6 +6,7 @@ import (
 
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/delivery/http"
+	"super-app-chonburi-go-mobile/internal/infrastructure"
 	"super-app-chonburi-go-mobile/internal/repository"
 	"super-app-chonburi-go-mobile/internal/usecase"
 	"super-app-chonburi-go-mobile/pkg/database"
@@ -52,8 +53,10 @@ func main() {
 		AllowCredentials: false,
 	}))
 
+	smsClient := infrastructure.NewSMSClient(cfg.SMSGatewayURL, cfg.SMSAPIKey, cfg.SMSAPISecret, cfg.SMSSenderName)
+
 	authRepo := repository.NewAuthRepository(database.DB)
-	authUseCase := usecase.NewAuthUseCase(authRepo, cfg)
+	authUseCase := usecase.NewAuthUseCase(authRepo, cfg, smsClient)
 	http.NewAuthHandler(app, authUseCase)
 
 	complaintRepo := repository.NewComplaintRepository(database.DB)

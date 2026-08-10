@@ -19,6 +19,7 @@ import (
 
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
+	"super-app-chonburi-go-mobile/internal/infrastructure"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -33,17 +34,19 @@ type otpData struct {
 }
 
 type authUseCase struct {
-	repo     domain.AuthRepository
-	config   *config.Config
-	otpStore map[string]otpData
-	otpMu    sync.RWMutex
+	repo      domain.AuthRepository
+	config    *config.Config
+	smsClient infrastructure.SMSService
+	otpStore  map[string]otpData
+	otpMu     sync.RWMutex
 }
 
-func NewAuthUseCase(repo domain.AuthRepository, cfg *config.Config) domain.AuthUseCase {
+func NewAuthUseCase(repo domain.AuthRepository, cfg *config.Config, smsClient infrastructure.SMSService) domain.AuthUseCase {
 	return &authUseCase{
-		repo:     repo,
-		config:   cfg,
-		otpStore: make(map[string]otpData),
+		repo:      repo,
+		config:    cfg,
+		smsClient: smsClient,
+		otpStore:  make(map[string]otpData),
 	}
 }
 
@@ -689,6 +692,13 @@ func (u *authUseCase) RequestOTP(phoneNumber string) (*domain.OTPRequestResponse
 	// พิมพ์รหัสออกหน้าจอ console เพื่อการทดสอบใน local dev
 	log.Printf("📱 [OTP Debug] Phone: %s -> OTP: %s, Ref: %s (Expires in 5m)", phoneNumber, otpCode, ref)
 
+	// หากมีการตั้งค่า SMS Service ให้ยิงส่ง SMS จริงไปยัง Gateway / Server ปลายทาง
+	if u.smsClient != nil {
+		if err := u.smsClient.SendOTP(context.Background(), phoneNumber, otpCode, ref); err != nil {
+			log.Printf("⚠️ [SMS Gateway Warning] Failed to send SMS via Gateway: %v", err)
+		}
+	}
+
 	return &domain.OTPRequestResponse{
 		Success: true,
 		Ref:     ref,
@@ -746,9 +756,9 @@ func (u *authUseCase) VerifyOTP(phoneNumber, otp, ref string) (*domain.OTPVerify
 	}, nil
 }
 
-func (u *authUseCase) Register(pin, tempToken string) (*domain.AuthResponse, error) {
+func (u *authUseCase) Register(req domain.RegisterRequest) (*domain.AuthResponse, error) {
 	// Parse tempToken และทำการตรวจสอบ
-	parsedToken, err := jwt.Parse(tempToken, func(token *jwt.Token) (interface{}, error) {
+	parsedToken, err := jwt.Parse(req.TempToken, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
 		}
@@ -779,10 +789,47 @@ func (u *authUseCase) Register(pin, tempToken string) (*domain.AuthResponse, err
 		return nil, errors.New("phone number is already registered")
 	}
 
+	// Validate SHA-256 Hash format
+	isValidSHA256 := func(s string) bool {
+		if len(s) != 64 {
+			return false
+		}
+		for _, c := range s {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if req.IDCardHash != "" && !isValidSHA256(req.IDCardHash) {
+		return nil, errors.New("invalid id_card_hash format")
+	}
+	if req.LaserIDHash != "" && !isValidSHA256(req.LaserIDHash) {
+		return nil, errors.New("invalid laser_id_hash format")
+	}
+
 	// เข้ารหัส PIN
-	hashedPin, err := bcrypt.GenerateFromPassword([]byte(pin), bcrypt.DefaultCost)
+	hashedPin, err := bcrypt.GenerateFromPassword([]byte(req.Pin), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, fmt.Errorf("failed to hash pin: %w", err)
+	}
+
+	// แปลง วันเกิด (ISO YYYY-MM-DD -> time.Time)
+	var birthday *time.Time
+	if req.Birthday != "" {
+		if t, err := time.Parse("2006-01-02", req.Birthday); err == nil {
+			birthday = &t
+		}
+	}
+
+	name := req.FirstName
+	if name == "" {
+		name = "ผู้ใช้ชลบุรีพลัส"
+	}
+	lastName := req.LastName
+	if lastName == "" {
+		lastName = fmt.Sprintf("เบอร์ %s", phoneNumber[len(phoneNumber)-4:])
 	}
 
 	userID := uuid.New()
@@ -798,16 +845,33 @@ func (u *authUseCase) Register(pin, tempToken string) (*domain.AuthResponse, err
 		UpdatedDate:     time.Now(),
 		Information: &domain.UserInformation{
 			UserId:             userID,
-			Name:               "ผู้ใช้ชลบุรีพลัส", // Default name
-			LastName:           fmt.Sprintf("เบอร์ %s", phoneNumber[len(phoneNumber)-4:]),
+			Prefix:             req.Prefix,
+			Name:               name,
+			LastName:           lastName,
 			Phone:              phoneNumber,
+			Birthday:           birthday,
+			IdentityNumberHash: req.IDCardHash,
+			LaserIdHash:        req.LaserIDHash,
 			Status:             "active",
 			VerificationStatus: "unverified",
+			BuildingName:       req.Building,
+			RoomNumber:         req.RoomNo,
+			Alley:              req.Soi,
+			VillageNumber:      req.VillageNo,
+			Road:               req.Road,
+			Province:           req.Province,
+			District:           req.District,
+			Subdistrict:        req.SubDistrict,
 			IsConsent:          true,
 			CreatedBy:          "registration_flow",
 			CreatedDate:        time.Now(),
 			UpdatedDate:        time.Now(),
 		},
+	}
+
+	if req.Email != "" {
+		user.Email = &req.Email
+		user.Information.Email = &req.Email
 	}
 
 	// สร้างผู้ใช้ในฐานข้อมูล

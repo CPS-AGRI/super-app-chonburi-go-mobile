@@ -140,8 +140,28 @@ type OTPVerifyResponse struct {
 }
 
 type RegisterRequest struct {
-	Pin       string `json:"pin"`
-	TempToken string `json:"temp_token"`
+	TempToken   string `json:"temp_token"`
+	Pin         string `json:"pin"`
+	DeviceID    string `json:"device_id"`
+	DeviceName  string `json:"device_name"`
+	Platform    string `json:"platform"`
+	IDCardHash  string `json:"id_card_hash"`
+	LaserIDHash string `json:"laser_id_hash"`
+	Prefix      string `json:"prefix"`
+	FirstName   string `json:"first_name"`
+	LastName    string `json:"last_name"`
+	Email       string `json:"email"`
+	Birthday    string `json:"birthday"`
+	Building    string `json:"building"`
+	RoomNo      string `json:"room_no"`
+	Floor       string `json:"floor"`
+	Soi         string `json:"soi"`
+	VillageNo   string `json:"village_no"`
+	Road        string `json:"road"`
+	Province    string `json:"province"`
+	District    string `json:"district"`
+	SubDistrict string `json:"sub_district"`
+	PostalCode  string `json:"postal_code"`
 }
 
 type PinLoginRequest struct {
@@ -157,7 +177,7 @@ type AuthUseCase interface {
 	RefreshToken(refreshToken string) (*AuthResponse, error)
 	RequestOTP(phoneNumber string) (*OTPRequestResponse, error)
 	VerifyOTP(phoneNumber, otp, ref string) (*OTPVerifyResponse, error)
-	Register(pin, tempToken string) (*AuthResponse, error)
+	Register(req RegisterRequest) (*AuthResponse, error)
 	LoginWithPin(phoneNumber, pin string) (*AuthResponse, error)
 	BindPhone(provider, idToken, phoneNumber, otp, ref, pin string) (*AuthResponse, error)
 	CheckPhone(phoneNumber string) (bool, error)
