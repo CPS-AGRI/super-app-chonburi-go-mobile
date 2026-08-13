@@ -279,6 +279,11 @@ func (u *authUseCase) LoginWithFacebook(accessToken string) (*domain.AuthRespons
 		return nil, err
 	}
 
+	// Preload full relations
+	if fullUser, err := u.repo.GetByID(user.ID); err == nil && fullUser != nil {
+		user = fullUser
+	}
+
 	return &domain.AuthResponse{
 		AccessToken:  accessTokenJWT,
 		RefreshToken: refreshTokenJWT,
