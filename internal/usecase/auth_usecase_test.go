@@ -93,7 +93,7 @@ func setupTestUseCase() (domain.AuthUseCase, *MockAuthRepository, *MockSMSServic
 	}
 	mockRepo := new(MockAuthRepository)
 	mockSMS := new(MockSMSService)
-	authUC := usecase.NewAuthUseCase(mockRepo, cfg, mockSMS)
+	authUC := usecase.NewAuthUseCase(mockRepo, cfg, mockSMS, nil)
 	return authUC, mockRepo, mockSMS, cfg
 }
 

@@ -39,6 +39,12 @@ type Config struct {
 	SMSAPIKey     string
 	SMSAPISecret  string
 	SMSSenderName string
+
+	RedisHost     string
+	RedisPort     string
+	RedisAddr     string // host:port — ใช้ field นี้กับ RedisClient
+	RedisPassword string
+	RedisDB       int
 }
 
 type MinIOConfig struct {
@@ -156,6 +162,27 @@ func LoadConfig() *Config {
 		SMSAPIKey:     os.Getenv("SMS_API_KEY"),
 		SMSAPISecret:  os.Getenv("SMS_API_SECRET"),
 		SMSSenderName: os.Getenv("SMS_SENDER_NAME"),
+		RedisHost: os.Getenv("REDIS_HOST"),
+		RedisPort: func() string {
+			p := os.Getenv("REDIS_PORT")
+			if p == "" {
+				p = "6379"
+			}
+			return p
+		}(),
+		RedisAddr: func() string {
+			host := os.Getenv("REDIS_HOST")
+			port := os.Getenv("REDIS_PORT")
+			if port == "" {
+				port = "6379"
+			}
+			return host + ":" + port
+		}(),
+		RedisPassword: os.Getenv("REDIS_PASSWORD"),
+		RedisDB: func() int {
+			db, _ := strconv.Atoi(os.Getenv("REDIS_DB"))
+			return db
+		}(),
 	}
 }
 

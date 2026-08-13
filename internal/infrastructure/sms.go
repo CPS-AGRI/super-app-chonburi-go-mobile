@@ -42,22 +42,40 @@ func (s *SMSClient) SendOTP(ctx context.Context, phoneNumber, otpCode, ref strin
 		return nil
 	}
 
-	// แปลงเบอร์โทรศัพท์ให้อยู่ในรูปแบบสากล/ตัวเลข (เช่น 0812345678)
+	// แปลงเบอร์โทรศัพท์ให้อยู่ในรูปแบบตัวเลขเพียวๆ (เช่น 0864652825)
 	cleanPhone := strings.ReplaceAll(phoneNumber, "-", "")
 	cleanPhone = strings.TrimSpace(cleanPhone)
 
-	msg := fmt.Sprintf("Your OTP is %s. Reference: %s. Mueang Smart", otpCode, ref)
+	rawMsg := fmt.Sprintf("Your OTP is %s. Reference: %s. Mueang Smart", otpCode, ref)
 	sender := s.senderName
 	if sender == "" {
 		sender = "FAHFON"
 	}
 
-	// โครงสร้าง Payload ของ dtac SMS Corporate Link (apismsplus.dtac.co.th)
+	// แปลงข้อความตาม TIS-620 / Windows-874 เป็น Hex Code Point (X4) แบบ 1:1 กับ C# GetEncoding(874)
+	var hexBuilder strings.Builder
+	for _, r := range rawMsg {
+		var codePoint rune
+		if r <= 0x7F {
+			// ASCII range
+			codePoint = r
+		} else if r >= 0x0E01 && r <= 0x0E5B {
+			// Thai UTF-8 range (U+0E01 - U+0E5B) -> TIS-620 (0xA1 - 0xFB)
+			codePoint = r - 0x0E00 + 0xA0
+		} else {
+			codePoint = r
+		}
+		hexBuilder.WriteString(fmt.Sprintf("%04X", codePoint))
+	}
+
+	// โครงสร้าง Payload ของ dtac SMS Corporate Link ตรงตาม MueangSmart C# SMSService.cs 1:1
 	formData := url.Values{}
 	formData.Set("User", s.username)
 	formData.Set("Password", s.password)
-	formData.Set("Msisdn", cleanPhone)
-	formData.Set("Msg", msg)
+	formData.Set("Msg", hexBuilder.String())
+	formData.Set("Encoding", "8")
+	formData.Set("Msn", cleanPhone)
+	formData.Set("MsgType", "H")
 	formData.Set("Sender", sender)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.gatewayURL, strings.NewReader(formData.Encode()))

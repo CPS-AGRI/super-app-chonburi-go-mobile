@@ -54,9 +54,10 @@ func main() {
 	}))
 
 	smsClient := infrastructure.NewSMSClient(cfg.SMSGatewayURL, cfg.SMSAPIKey, cfg.SMSAPISecret, cfg.SMSSenderName)
+	redisClient, _ := infrastructure.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
 
 	authRepo := repository.NewAuthRepository(database.DB)
-	authUseCase := usecase.NewAuthUseCase(authRepo, cfg, smsClient)
+	authUseCase := usecase.NewAuthUseCase(authRepo, cfg, smsClient, redisClient)
 	http.NewAuthHandler(app, authUseCase)
 
 	complaintRepo := repository.NewComplaintRepository(database.DB)

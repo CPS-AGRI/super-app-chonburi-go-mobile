@@ -174,6 +174,7 @@ type AuthUseCase interface {
 	LoginWithFacebook(accessToken string) (*AuthResponse, error)
 	LoginWithLine(code string, redirectURI string) (*AuthResponse, error)
 	LoginWithThaiID(code string, redirectURI string) (*AuthResponse, error)
+	BindThaiID(userID string, code string, redirectURI string) (*AuthResponse, error)
 	RefreshToken(refreshToken string) (*AuthResponse, error)
 	RequestOTP(phoneNumber string) (*OTPRequestResponse, error)
 	VerifyOTP(phoneNumber, otp, ref string) (*OTPVerifyResponse, error)

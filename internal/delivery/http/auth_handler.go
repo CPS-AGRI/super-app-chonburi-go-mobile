@@ -2,6 +2,7 @@ package http
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/gofiber/fiber/v3"
 	"super-app-chonburi-go-mobile/internal/domain"
@@ -20,6 +21,7 @@ func NewAuthHandler(app *fiber.App, usecase domain.AuthUseCase) {
 	group.Post("/line", handler.LoginWithLine)
 	group.Post("/thaiid", handler.LoginWithThaiID)
 	group.Get("/thaiid/callback", handler.ThaiIDCallback)
+	group.Post("/thaiid/bind", handler.BindThaiID)
 	group.Post("/refresh", handler.RefreshToken)
 	group.Post("/otp/request", handler.RequestOTP)
 	group.Post("/otp/verify", handler.VerifyOTP)
@@ -117,6 +119,36 @@ func (h *AuthHandler) ThaiIDCallback(c fiber.Ctx) error {
 
 	redirectURL := fmt.Sprintf("chonburiplus://thaiid?code=%s&state=%s", code, state)
 	return c.Redirect().Status(fiber.StatusFound).To(redirectURL)
+}
+
+func (h *AuthHandler) BindThaiID(c fiber.Ctx) error {
+	var req struct {
+		UserID      string `json:"user_id"`
+		Code        string `json:"code"`
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	// ถ้าไม่ได้ส่ง user_id มา ให้ลองดึงจาก Authorization header (Bearer JWT)
+	if req.UserID == "" {
+		auth := c.Get("Authorization")
+		if strings.HasPrefix(auth, "Bearer ") {
+			req.UserID = c.Get("X-User-ID") // middleware ควร inject ไว้ ถ้ายังไม่มีให้ client ส่งมา
+		}
+	}
+
+	if req.UserID == "" || req.Code == "" || req.RedirectURI == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "user_id, code, and redirect_uri are required"})
+	}
+
+	res, err := h.usecase.BindThaiID(req.UserID, req.Code, req.RedirectURI)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(res)
 }
 
 func (h *AuthHandler) RefreshToken(c fiber.Ctx) error {
@@ -220,8 +252,8 @@ func (h *AuthHandler) BindPhone(c fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	if req.IDToken == "" || req.PhoneNumber == "" || req.OTP == "" || req.Ref == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "id_token, phone_number, otp, and ref are required"})
+	if req.IDToken == "" || req.PhoneNumber == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "id_token and phone_number are required"})
 	}
 
 	provider := req.Provider
