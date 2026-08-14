@@ -512,34 +512,28 @@ func (u *authUseCase) LoginWithFacebook(accessToken string) (*domain.AuthRespons
 	}, nil
 }
 
-func (u *authUseCase) LoginWithLine(code string, redirectURI string) (*domain.AuthResponse, error) {
-	// 1. Exchange Authorization Code for Access Token
-	tokenData := url.Values{}
-	tokenData.Set("grant_type", "authorization_code")
-	tokenData.Set("code", code)
-	tokenData.Set("redirect_uri", redirectURI)
-	tokenData.Set("client_id", u.config.LineChannelID)
-	tokenData.Set("client_secret", u.config.LineChannelSecret)
+func (u *authUseCase) LoginWithLine(codeOrToken string, redirectURI string) (*domain.AuthResponse, error) {
+	lineAccessToken := codeOrToken
 
-	tokenResp, err := http.PostForm("https://api.line.me/oauth2/v2.1/token", tokenData)
-	if err != nil {
-		return nil, fmt.Errorf("failed to call line token api: %w", err)
-	}
-	defer tokenResp.Body.Close()
+	// Check if codeOrToken is an authorization code that needs exchange
+	if len(codeOrToken) < 60 || strings.Contains(codeOrToken, "-") == false {
+		tokenData := url.Values{}
+		tokenData.Set("grant_type", "authorization_code")
+		tokenData.Set("code", codeOrToken)
+		tokenData.Set("redirect_uri", redirectURI)
+		tokenData.Set("client_id", u.config.LineChannelID)
+		tokenData.Set("client_secret", u.config.LineChannelSecret)
 
-	if tokenResp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("invalid line auth code or secret (status %d)", tokenResp.StatusCode)
-	}
-
-	var tokenResult struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err != nil {
-		return nil, fmt.Errorf("failed to parse line token response: %w", err)
-	}
-
-	if tokenResult.AccessToken == "" {
-		return nil, errors.New("line access token is empty")
+		tokenResp, err := http.PostForm("https://api.line.me/oauth2/v2.1/token", tokenData)
+		if err == nil && tokenResp.StatusCode == http.StatusOK {
+			var tokenResult struct {
+				AccessToken string `json:"access_token"`
+			}
+			if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err == nil && tokenResult.AccessToken != "" {
+				lineAccessToken = tokenResult.AccessToken
+			}
+			tokenResp.Body.Close()
+		}
 	}
 
 	// 2. Fetch User Profile using Access Token
@@ -547,7 +541,7 @@ func (u *authUseCase) LoginWithLine(code string, redirectURI string) (*domain.Au
 	if err != nil {
 		return nil, fmt.Errorf("failed to create profile request: %w", err)
 	}
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", tokenResult.AccessToken))
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", lineAccessToken))
 
 	profileResp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -639,6 +633,11 @@ func (u *authUseCase) LoginWithLine(code string, redirectURI string) (*domain.Au
 	refreshTokenJWT, err := u.generateRefreshToken(user)
 	if err != nil {
 		return nil, err
+	}
+
+	// Preload full relations
+	if fullUser, err := u.repo.GetByID(user.ID); err == nil && fullUser != nil {
+		user = fullUser
 	}
 
 	return &domain.AuthResponse{
@@ -1201,7 +1200,7 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		}
 	}
 
-	// 2. ตรวจสอบ JWT Token เพื่อเอา oauthID จาก Provider
+	// 2. ตรวจสอบ Token เพื่อเอา oauthID จาก Provider
 	var oauthID string
 	if provider == "facebook" {
 		// รองรับทั้ง Limited Login JWT Token และ Standard Graph API Access Token
@@ -1229,6 +1228,23 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 				return nil, errors.New("facebook profile id is empty")
 			}
 			oauthID = fbProfile.ID
+		}
+	} else if provider == "line" {
+		// Fetch LINE profile using idToken as access token
+		req, err := http.NewRequest(http.MethodGet, "https://api.line.me/v2/profile", nil)
+		if err == nil {
+			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", idToken))
+			if resp, err := http.DefaultClient.Do(req); err == nil && resp.StatusCode == http.StatusOK {
+				var lineProfile struct {
+					UserID string `json:"userId"`
+				}
+				_ = json.NewDecoder(resp.Body).Decode(&lineProfile)
+				resp.Body.Close()
+				oauthID = lineProfile.UserID
+			}
+		}
+		if oauthID == "" {
+			return nil, errors.New("invalid or expired line token")
 		}
 	} else {
 		// Google Validation
