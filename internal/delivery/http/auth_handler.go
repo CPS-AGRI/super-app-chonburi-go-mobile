@@ -53,17 +53,30 @@ func (h *AuthHandler) LoginWithGoogle(c fiber.Ctx) error {
 
 func (h *AuthHandler) LoginWithFacebook(c fiber.Ctx) error {
 	var req struct {
-		AccessToken string `json:"access_token"`
+		AccessToken string `json:"access_token"` // Standard Login
+		AuthToken   string `json:"auth_token"`   // Limited Login (iOS JWT)
 	}
 	if err := c.Bind().Body(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
+	// Prefer Limited Login JWT token (from iOS native SDK)
+	if req.AuthToken != "" {
+		res, err := h.usecase.LoginWithFacebookLimited(req.AuthToken)
+		if err != nil {
+			return c.Status(401).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(res)
+	}
+
+	// Fallback to Standard Graph API access token
+	if req.AccessToken == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "access_token or auth_token is required"})
+	}
 	res, err := h.usecase.LoginWithFacebook(req.AccessToken)
 	if err != nil {
 		return c.Status(401).JSON(fiber.Map{"error": err.Error()})
 	}
-
 	return c.JSON(res)
 }
 

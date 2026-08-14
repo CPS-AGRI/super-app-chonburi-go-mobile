@@ -39,23 +39,59 @@ func (r *authRepository) GetByProviderID(provider, providerID string) (*domain.A
 }
 
 func (r *authRepository) GetByEmail(email string) (*domain.AppUser, error) {
-	var info domain.UserInformation
-	err := r.db.Where("email = ?", email).First(&info).Error
-	if err != nil {
-		return nil, err
+	if email == "" {
+		return nil, gorm.ErrRecordNotFound
 	}
 
+	// 1. Search in users table
 	var user domain.AppUser
-	err = r.db.Preload("Information").Preload("OauthAccounts").First(&user, info.UserId).Error
-	if err != nil {
-		return nil, err
+	if err := r.db.Preload("Information").Preload("OauthAccounts").Where("email = ?", email).First(&user).Error; err == nil {
+		return &user, nil
 	}
-	return &user, nil
+
+	// 2. Search in user_informations table
+	var info domain.UserInformation
+	if err := r.db.Where("email = ?", email).First(&info).Error; err == nil {
+		if err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, info.UserId).Error; err == nil {
+			return &user, nil
+		}
+	}
+
+	// 3. Search in user_oauth_accounts table
+	var oauthAcc domain.UserOauthAccount
+	if err := r.db.Where("email = ?", email).First(&oauthAcc).Error; err == nil {
+		if err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, oauthAcc.UserId).Error; err == nil {
+			return &user, nil
+		}
+	}
+
+	return nil, gorm.ErrRecordNotFound
 }
 
 func (r *authRepository) GetByPhoneNumber(phoneNumber string) (*domain.AppUser, error) {
+	if phoneNumber == "" {
+		return nil, gorm.ErrRecordNotFound
+	}
+	clean := phoneNumber
+	for len(clean) > 0 && (clean[0] == '+' || clean[0] == ' ') {
+		clean = clean[1:]
+	}
+
+	var formats []string
+	formats = append(formats, phoneNumber)
+
+	if len(clean) == 10 && clean[0] == '0' {
+		// e.g. 0812345678 -> +66812345678, 66812345678
+		suffix := clean[1:]
+		formats = append(formats, "+66"+suffix, "66"+suffix)
+	} else if len(clean) == 11 && clean[:2] == "66" {
+		// e.g. 66812345678 -> 0812345678, +66812345678
+		suffix := clean[2:]
+		formats = append(formats, "0"+suffix, "+66"+suffix)
+	}
+
 	var user domain.AppUser
-	err := r.db.Preload("Information").Preload("OauthAccounts").Where("phone_number = ?", phoneNumber).First(&user).Error
+	err := r.db.Preload("Information").Preload("OauthAccounts").Where("phone_number IN ?", formats).First(&user).Error
 	if err != nil {
 		return nil, err
 	}
@@ -97,6 +133,10 @@ func (r *authRepository) CreateOauthAccount(oauth *domain.UserOauthAccount) erro
 
 func (r *authRepository) UpdateOauthAccount(oauth *domain.UserOauthAccount) error {
 	return r.db.Save(oauth).Error
+}
+
+func (r *authRepository) DeleteOauthAccount(id uuid.UUID) error {
+	return r.db.Where("id = ?", id).Delete(&domain.UserOauthAccount{}).Error
 }
 
 func (r *authRepository) Delete(user *domain.AppUser) error {

@@ -114,6 +114,7 @@ type AuthRepository interface {
 	Update(user *AppUser) error
 	CreateOauthAccount(oauth *UserOauthAccount) error
 	UpdateOauthAccount(oauth *UserOauthAccount) error
+	DeleteOauthAccount(id uuid.UUID) error
 	Delete(user *AppUser) error
 }
 
@@ -172,6 +173,7 @@ type PinLoginRequest struct {
 type AuthUseCase interface {
 	LoginWithGoogle(idToken string) (*AuthResponse, error)
 	LoginWithFacebook(accessToken string) (*AuthResponse, error)
+	LoginWithFacebookLimited(authToken string) (*AuthResponse, error)
 	LoginWithLine(code string, redirectURI string) (*AuthResponse, error)
 	LoginWithThaiID(code string, redirectURI string) (*AuthResponse, error)
 	BindThaiID(userID string, code string, redirectURI string) (*AuthResponse, error)
