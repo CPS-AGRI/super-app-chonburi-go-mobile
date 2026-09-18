@@ -26,6 +26,10 @@ type Config struct {
 	ThaiIDApiKey       string
 	ThaiIDRedirectURI  string
 
+	// Security: Thai citizen ID (PID) protection — PDPA compliance
+	PIDHmacSecret    string // HMAC-SHA256 key for PID hashing (lookup)
+	PIDEncryptionKey string // AES-256-GCM key (must be exactly 32 bytes in hex)
+
 	SMTPHost     string
 	SMTPPort     string
 	SMTPEmail    string
@@ -140,6 +144,8 @@ func LoadConfig() *Config {
 		ThaiIDClientSecret: os.Getenv("THAIID_CLIENT_SECRET"),
 		ThaiIDApiKey:       os.Getenv("THAIID_API_KEY"),
 		ThaiIDRedirectURI:  os.Getenv("THAIID_REDIRECT_URI"),
+		PIDHmacSecret:     os.Getenv("PID_HMAC_SECRET"),
+		PIDEncryptionKey:  os.Getenv("PID_ENCRYPTION_KEY"),
 		SMTPHost:           os.Getenv("SMTP_HOST"),
 		SMTPPort:           os.Getenv("SMTP_PORT"),
 		SMTPEmail:          os.Getenv("SMTP_EMAIL"),

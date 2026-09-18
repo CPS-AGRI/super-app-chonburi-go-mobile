@@ -3,6 +3,7 @@ package usecase
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"super-app-chonburi-go-mobile/internal/domain"
 
@@ -21,6 +22,11 @@ func formatThaiAddress(info *domain.UserInformation) string {
 	if info == nil {
 		return ""
 	}
+	// หาก Subdistrict เป็นข้อความรวมที่อยู่เต็มมาจาก DOPA (มี "ต.", "อ.", "จ.", "แขวง", "เขต")
+	if strings.Contains(info.Subdistrict, "ต.") || strings.Contains(info.Subdistrict, "อ.") || strings.Contains(info.Subdistrict, "แขวง") || strings.Contains(info.Subdistrict, "เขต") {
+		return info.Subdistrict
+	}
+
 	var addr string
 	if info.HouseNumber != "" {
 		addr += info.HouseNumber
@@ -70,7 +76,7 @@ func formatThaiAddress(info *domain.UserInformation) string {
 	if info.PostalCode > 0 {
 		addr += fmt.Sprintf(" %d", info.PostalCode)
 	}
-	return addr
+	return strings.TrimSpace(addr)
 }
 
 func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error) {

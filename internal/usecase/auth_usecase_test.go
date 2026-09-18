@@ -77,6 +77,11 @@ func (m *MockAuthRepository) Delete(user *domain.AppUser) error {
 	return args.Error(0)
 }
 
+func (m *MockAuthRepository) DeleteOauthAccount(id uuid.UUID) error {
+	args := m.Called(id)
+	return args.Error(0)
+}
+
 // MockSMSService implements infrastructure.SMSService for testing
 type MockSMSService struct {
 	mock.Mock

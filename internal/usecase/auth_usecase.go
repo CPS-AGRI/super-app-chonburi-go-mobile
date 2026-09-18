@@ -2,6 +2,9 @@ package usecase
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -648,8 +651,8 @@ func (u *authUseCase) LoginWithLine(codeOrToken string, redirectURI string) (*do
 }
 
 func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.AuthResponse, error) {
-	// 1. Exchange Authorization Code for Access Token
-	tokenURL := "https://imauthsbx.bora.dopa.go.th/api/v2/oauth2/token/" // [SANDBOX] Production: "https://imauth.bora.dopa.go.th/api/v2/oauth2/token/"
+	// 1. Exchange Authorization Code for Access Token (DOPA Production)
+	tokenURL := "https://imauth.bora.dopa.go.th/api/v2/oauth2/token/"
 	data := url.Values{}
 	data.Set("grant_type", "authorization_code")
 	data.Set("code", code)
@@ -673,54 +676,44 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 	defer respToken.Body.Close()
 
 	if respToken.StatusCode != http.StatusOK {
-		var errData map[string]interface{}
-		_ = json.NewDecoder(respToken.Body).Decode(&errData)
-		return nil, fmt.Errorf("token exchange failed with status %d: %v", respToken.StatusCode, errData)
+		bodyBytes, _ := io.ReadAll(respToken.Body)
+		bodyStr := string(bodyBytes)
+		log.Printf("[ThaiID Error] Token exchange failed. Status: %d, Response: %s, RedirectURI used: %s", respToken.StatusCode, bodyStr, redirectURI)
+		return nil, fmt.Errorf("token exchange failed with status %d: %s", respToken.StatusCode, bodyStr)
 	}
 
-	var tokenResult struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(respToken.Body).Decode(&tokenResult); err != nil {
+	// DOPA returns all user profile fields directly in the token response body.
+	// No separate userinfo call is required.
+	tokenBodyBytes, _ := io.ReadAll(respToken.Body)
+
+	var thaiIDProfile map[string]interface{}
+	if err := json.Unmarshal(tokenBodyBytes, &thaiIDProfile); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
 
-	if tokenResult.AccessToken == "" {
+	accessToken, _ := thaiIDProfile["access_token"].(string)
+	if accessToken == "" {
 		return nil, errors.New("thaiid access token is empty")
-	}
-
-	// 2. Fetch UserInfo profile using Access Token
-	userInfoURL := "https://imauthsbx.bora.dopa.go.th/api/v2/oauth2/userinfo/" // [SANDBOX] Production: "https://imauth.bora.dopa.go.th/api/v2/oauth2/userinfo/"
-	reqProfile, err := http.NewRequest(http.MethodGet, userInfoURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create userinfo request: %w", err)
-	}
-	reqProfile.Header.Set("Authorization", fmt.Sprintf("Bearer %s", tokenResult.AccessToken))
-	reqProfile.Header.Set("x-api-key", u.config.ThaiIDApiKey)
-
-	respProfile, err := client.Do(reqProfile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute userinfo request: %w", err)
-	}
-	defer respProfile.Body.Close()
-
-	if respProfile.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch user info (status %d)", respProfile.StatusCode)
-	}
-
-	var thaiIDProfile map[string]interface{}
-	if err := json.NewDecoder(respProfile.Body).Decode(&thaiIDProfile); err != nil {
-		return nil, fmt.Errorf("failed to decode userinfo response: %w", err)
 	}
 
 	pid, _ := thaiIDProfile["pid"].(string)
 	if pid == "" {
-		return nil, errors.New("pid is empty in userinfo response")
+		log.Printf("[ThaiID Error] pid is empty. Full token response: %v", thaiIDProfile)
+		return nil, errors.New("pid is empty in token response")
 	}
+	log.Printf("[ThaiID Debug] Token exchange OK. pid=%s", pid)
 
-	// Marshal raw profile data to save in UserOauthAccount
-	rawBytes, _ := json.Marshal(thaiIDProfile)
+	// Marshal raw profile data — strip sensitive PID field before storing
+	safeProfile := make(map[string]interface{})
+	for k, v := range thaiIDProfile {
+		if k == "pid" || k == "access_token" || k == "refresh_token" {
+			continue // never persist raw PID or DOPA tokens to DB
+		}
+		safeProfile[k] = v
+	}
+	rawBytes, _ := json.Marshal(safeProfile)
 	rawDataStr := string(rawBytes)
+
 
 	// Acquire Redis Distributed Lock for the target PID to prevent race conditions
 	if u.redisClient != nil {
@@ -731,8 +724,9 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 		}
 	}
 
-	// 3. Match or register user based on pid
-	user, err := u.repo.GetByProviderID("thaiid", pid)
+	// 3. Match or register user based on HMAC hash of pid (not raw pid)
+	pidHash := hmacSHA256(pid, u.config.PIDHmacSecret)
+	user, err := u.repo.GetByProviderID("thaiid", pidHash)
 	if err != nil {
 		// Not found: Create a brand new user
 		newUserID := uuid.New()
@@ -791,11 +785,13 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 			subdistrict = addrStr
 		}
 
-		// Encrypt and hash identity number (PID)
-		h := sha256.New()
-		h.Write([]byte(pid))
-		identityHash := hex.EncodeToString(h.Sum(nil))
-		identityEncrypted := "ENC_" + pid
+		// Secure hash and encrypt PID — PDPA compliance
+		identityHash := hmacSHA256(pid, u.config.PIDHmacSecret)
+		identityEncrypted, err := encryptAES256GCM(pid, u.config.PIDEncryptionKey)
+		if err != nil {
+			log.Printf("[ThaiID Error] Failed to encrypt PID: %v", err)
+			return nil, fmt.Errorf("failed to secure identity number: %w", err)
+		}
 
 		idCardTypeVal := 1
 
@@ -812,9 +808,9 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 					ID:          uuid.New(),
 					UserId:      newUserID,
 					Provider:    "thaiid",
-					ProviderId:  pid,
+					ProviderId:  pidHash, // stored as HMAC hash — never raw PID
 					DisplayName: displayName,
-					RawData:     rawDataStr,
+					RawData:     rawDataStr, // PID already stripped from this
 					CreatedAt:   time.Now(),
 				},
 			},
@@ -1177,6 +1173,39 @@ func hashValue(v string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// hmacSHA256 creates a keyed hash of value using HMAC-SHA256.
+// Resistant to rainbow table attacks because the secret key is required.
+// Used for PID hashing (lookup key in DB).
+func hmacSHA256(value, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(value))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// encryptAES256GCM encrypts plaintext using AES-256-GCM with a random 12-byte nonce.
+// keyHex must be a 64-character hex string (32 bytes = 256-bit key).
+// Returns base64(nonce + ciphertext) for storage.
+func encryptAES256GCM(plaintext, keyHex string) (string, error) {
+	keyBytes, err := hex.DecodeString(keyHex)
+	if err != nil || len(keyBytes) != 32 {
+		return "", fmt.Errorf("PID_ENCRYPTION_KEY must be a 64-char hex string (32 bytes): %w", err)
+	}
+	block, err := aes.NewCipher(keyBytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("failed to create GCM: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize()) // 12 bytes
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("failed to generate nonce: %w", err)
+	}
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
 func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin string) (*domain.AuthResponse, error) {
 	// 1. ตรวจสอบรหัส OTP และ Ref Code (หากมีการส่งมาตรวจสอบ)
 	if otp != "" && ref != "" {
@@ -1246,6 +1275,9 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		if oauthID == "" {
 			return nil, errors.New("invalid or expired line token")
 		}
+	} else if provider == "thaiid" {
+		// idToken for thaiid is the pidHash (HMAC hash of PID) or provider_id
+		oauthID = idToken
 	} else {
 		// Google Validation
 		payload, err := idtoken.Validate(context.Background(), idToken, "")
@@ -1255,9 +1287,14 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		oauthID = payload.Subject
 	}
 
-	// ค้นหาบัญชีชั่วคราวจาก oauthID
+	// ค้นหาบัญชีชั่วคราวจาก oauthID หรือ tempUser ID (UUID)
 	tempUser, err := u.repo.GetByProviderID(provider, oauthID)
 	if err != nil {
+		if parsedID, parseErr := uuid.Parse(oauthID); parseErr == nil {
+			tempUser, err = u.repo.GetByID(parsedID)
+		}
+	}
+	if err != nil || tempUser == nil {
 		return nil, fmt.Errorf("temporary %s user not found", provider)
 	}
 
@@ -1319,6 +1356,13 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 	}
 
 	// กรณีที่ 2: มีเบอร์นี้ในระบบอยู่แล้ว (ย้าย OAuth Accounts จากบัญชีชั่วคราวมาผูกกับ existingUser)
+	// หากมีการส่ง PIN มาเพื่อยืนยันตัวตน ให้ตรวจสอบ PIN ของ existingUser
+	if pin != "" && existingUser.PinHash != "" {
+		if err := bcrypt.CompareHashAndPassword([]byte(existingUser.PinHash), []byte(pin)); err != nil {
+			return nil, errors.New("รหัส PIN ไม่ถูกต้อง")
+		}
+	}
+
 	for i := range tempUser.OauthAccounts {
 		acc := tempUser.OauthAccounts[i]
 		// ลบ record เก่าที่ผูกกับ tempUser ก่อน
@@ -1338,6 +1382,68 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		}
 		if err := u.repo.CreateOauthAccount(newOauth); err != nil {
 			log.Printf("[BindPhone] warning creating oauth account for existing user: %v", err)
+		}
+	}
+
+	// หาก tempUser มีข้อมูลยืนยันตัวตนจาก DOPA (ThaiID) ให้อัปเดตข้อมูลใส่ existingUser.Information
+	if tempUser.Information != nil {
+		if existingUser.Information == nil {
+			existingUser.Information = &domain.UserInformation{
+				UserId: existingUser.ID,
+			}
+		}
+		if tempUser.Information.Prefix != "" {
+			existingUser.Information.Prefix = tempUser.Information.Prefix
+		}
+		if tempUser.Information.Name != "" {
+			existingUser.Information.Name = tempUser.Information.Name
+		}
+		if tempUser.Information.LastName != "" {
+			existingUser.Information.LastName = tempUser.Information.LastName
+		}
+		if tempUser.Information.Birthday != nil {
+			existingUser.Information.Birthday = tempUser.Information.Birthday
+		}
+		if tempUser.Information.IdentityNumberEncrypted != "" {
+			existingUser.Information.IdentityNumberEncrypted = tempUser.Information.IdentityNumberEncrypted
+		}
+		if tempUser.Information.IdentityNumberHash != "" {
+			existingUser.Information.IdentityNumberHash = tempUser.Information.IdentityNumberHash
+		}
+		if tempUser.Information.HouseNumber != "" {
+			existingUser.Information.HouseNumber = tempUser.Information.HouseNumber
+		}
+		if tempUser.Information.VillageNumber != "" {
+			existingUser.Information.VillageNumber = tempUser.Information.VillageNumber
+		}
+		if tempUser.Information.Alley != "" {
+			existingUser.Information.Alley = tempUser.Information.Alley
+		}
+		if tempUser.Information.Road != "" {
+			existingUser.Information.Road = tempUser.Information.Road
+		}
+		if tempUser.Information.Subdistrict != "" {
+			existingUser.Information.Subdistrict = tempUser.Information.Subdistrict
+		}
+		if tempUser.Information.District != "" {
+			existingUser.Information.District = tempUser.Information.District
+		}
+		if tempUser.Information.Province != "" {
+			existingUser.Information.Province = tempUser.Information.Province
+		}
+		if tempUser.Information.IdCardType != nil {
+			existingUser.Information.IdCardType = tempUser.Information.IdCardType
+		}
+		if tempUser.Information.IdCardExpiry != nil {
+			existingUser.Information.IdCardExpiry = tempUser.Information.IdCardExpiry
+		}
+		if tempUser.Information.VerificationStatus == "verified" {
+			existingUser.Information.VerificationStatus = "verified"
+			existingUser.Information.VerifiedDate = tempUser.Information.VerifiedDate
+		}
+		existingUser.Information.UpdatedDate = time.Now()
+		if err := u.repo.Update(existingUser); err != nil {
+			log.Printf("[BindPhone] warning updating user information for existing user: %v", err)
 		}
 	}
 
@@ -1378,12 +1484,14 @@ func (u *authUseCase) CheckPhone(phoneNumber string) (bool, error) {
 // BindThaiID ผูกบัญชีที่ login อยู่แล้วกับ ThaiID (DOPA) OAuth
 // ขั้นตอน: Exchange code → Fetch DOPA userinfo → CreateOauthAccount → Update UserInformation
 func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string) (*domain.AuthResponse, error) {
-	// 1. Exchange Authorization Code for Access Token (DOPA Sandbox)
-	tokenURL := "https://imauthsbx.bora.dopa.go.th/api/v2/oauth2/token/" // [SANDBOX] Production: "https://imauth.bora.dopa.go.th/api/v2/oauth2/token/"
+	// 1. Exchange Authorization Code for Access Token (DOPA Production)
+	tokenURL := "https://imauth.bora.dopa.go.th/api/v2/oauth2/token/"
 	formData := url.Values{}
 	formData.Set("grant_type", "authorization_code")
 	formData.Set("code", code)
 	formData.Set("redirect_uri", redirectURI)
+	formData.Set("client_id", u.config.ThaiIDClientID)
+	formData.Set("client_secret", u.config.ThaiIDClientSecret)
 
 	reqToken, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(formData.Encode()))
 	if err != nil {
@@ -1402,48 +1510,32 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 	defer respToken.Body.Close()
 
 	if respToken.StatusCode != http.StatusOK {
-		var errData map[string]interface{}
-		_ = json.NewDecoder(respToken.Body).Decode(&errData)
-		return nil, fmt.Errorf("token exchange failed with status %d: %v", respToken.StatusCode, errData)
+		bodyBytes, _ := io.ReadAll(respToken.Body)
+		bodyStr := string(bodyBytes)
+		log.Printf("[ThaiID Error] BindThaiID Token exchange failed. Status: %d, Response: %s, RedirectURI used: %s", respToken.StatusCode, bodyStr, redirectURI)
+		return nil, fmt.Errorf("token exchange failed with status %d: %s", respToken.StatusCode, bodyStr)
 	}
 
-	var tokenResult struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(respToken.Body).Decode(&tokenResult); err != nil {
-		return nil, fmt.Errorf("failed to parse token response: %w", err)
-	}
-	if tokenResult.AccessToken == "" {
-		return nil, errors.New("thaiid access token is empty")
-	}
-
-	// 2. Fetch DOPA UserInfo
-	userInfoURL := "https://imauthsbx.bora.dopa.go.th/api/v2/oauth2/userinfo/" // [SANDBOX] Production: "https://imauth.bora.dopa.go.th/api/v2/oauth2/userinfo/"
-	reqProfile, err := http.NewRequest(http.MethodGet, userInfoURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create userinfo request: %w", err)
-	}
-	reqProfile.Header.Set("Authorization", fmt.Sprintf("Bearer %s", tokenResult.AccessToken))
-	reqProfile.Header.Set("x-api-key", u.config.ThaiIDApiKey)
-
-	respProfile, err := httpClient.Do(reqProfile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute userinfo request: %w", err)
-	}
-	defer respProfile.Body.Close()
-	if respProfile.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to fetch userinfo (status %d)", respProfile.StatusCode)
-	}
+	// 2. DOPA returns all user profile fields directly in the token response body.
+	// No separate userinfo call is required.
+	tokenBodyBytes, _ := io.ReadAll(respToken.Body)
 
 	var dopaProfile map[string]interface{}
-	if err := json.NewDecoder(respProfile.Body).Decode(&dopaProfile); err != nil {
-		return nil, fmt.Errorf("failed to decode userinfo: %w", err)
+	if err := json.Unmarshal(tokenBodyBytes, &dopaProfile); err != nil {
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	accessToken, _ := dopaProfile["access_token"].(string)
+	if accessToken == "" {
+		return nil, errors.New("thaiid access token is empty")
 	}
 
 	pid, _ := dopaProfile["pid"].(string)
 	if pid == "" {
-		return nil, errors.New("pid is empty in DOPA userinfo response")
+		log.Printf("[ThaiID Error] BindThaiID pid is empty. Full token response: %v", dopaProfile)
+		return nil, errors.New("pid is empty in token response")
 	}
+	log.Printf("[ThaiID Debug] BindThaiID Token exchange OK. pid=%s", pid)
 
 	// 3. ป้องกัน Race Condition ด้วย Redis Lock
 	if u.redisClient != nil {
@@ -1454,8 +1546,9 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 		}
 	}
 
-	// 4. ตรวจสอบว่า ThaiID PID นี้ถูกผูกกับบัญชีอื่นอยู่แล้วหรือไม่
-	if existing, err := u.repo.GetByProviderID("thaiid", pid); err == nil {
+	// 4. ตรวจสอบว่า ThaiID PID นี้ถูกผูกกับบัญชีอื่นอยู่แล้วหรือไม่ (ใช้ pidHash ให้ตรงกับ LoginWithThaiID)
+	pidHash := hmacSHA256(pid, u.config.PIDHmacSecret)
+	if existing, err := u.repo.GetByProviderID("thaiid", pidHash); err == nil {
 		if existing.ID.String() != userID {
 			return nil, errors.New("ThaiID นี้ถูกผูกกับบัญชีอื่นอยู่แล้ว")
 		}
@@ -1475,15 +1568,22 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 		return nil, fmt.Errorf("user not found: %w", err)
 	}
 
-	// 6. Marshal DOPA raw data
-	rawBytes, _ := json.Marshal(dopaProfile)
+	// 6. Strip sensitive PID field before storing raw profile data
+	safeProfile := make(map[string]interface{})
+	for k, v := range dopaProfile {
+		if k == "pid" || k == "access_token" || k == "refresh_token" {
+			continue
+		}
+		safeProfile[k] = v
+	}
+	rawBytes, _ := json.Marshal(safeProfile)
 
 	// 7. สร้าง OauthAccount ใหม่และ CreateOauthAccount
 	oauthAcc := &domain.UserOauthAccount{
 		ID:          uuid.New(),
 		UserId:      parsedID,
 		Provider:    "thaiid",
-		ProviderId:  pid,
+		ProviderId:  pidHash, // Stored as HMAC hash consistent with LoginWithThaiID
 		DisplayName: func() string {
 			if n, ok := dopaProfile["name"].(string); ok && n != "" {
 				return n
@@ -1510,7 +1610,11 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 		h.Write([]byte(pid))
 		user.Information.IdentityNumberHash = hex.EncodeToString(h.Sum(nil))
 		if user.Information.IdentityNumberEncrypted == "" {
-			user.Information.IdentityNumberEncrypted = "ENC_" + pid
+			if encrypted, err := encryptAES256GCM(pid, u.config.PIDEncryptionKey); err == nil {
+				user.Information.IdentityNumberEncrypted = encrypted
+			} else {
+				user.Information.IdentityNumberEncrypted = "ENC_" + pid
+			}
 		}
 
 		// เติมชื่อ-นามสกุลถ้ายังว่าง
@@ -1541,7 +1645,7 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 		updatedUser = user
 	}
 
-	accessToken, err := u.generateAccessToken(updatedUser)
+	accessToken, err = u.generateAccessToken(updatedUser)
 	if err != nil {
 		return nil, err
 	}

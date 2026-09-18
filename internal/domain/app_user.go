@@ -18,11 +18,11 @@ type UserOauthAccount struct {
 	ID          uuid.UUID `gorm:"type:uuid;primaryKey;default:uuid_generate_v4();column:id" json:"id"`
 	UserId      uuid.UUID `gorm:"type:uuid;not null;column:user_id" json:"user_id"`
 	Provider    string    `gorm:"type:text;not null;column:provider" json:"provider"` // google, facebook, line, apple
-	ProviderId  string    `gorm:"type:text;not null;column:provider_id" json:"provider_id"`
+	ProviderId  string    `gorm:"type:text;not null;column:provider_id" json:"-"`    // never expose — contains hashed PID for thaiid
 	Email       string    `gorm:"type:text;column:email" json:"email"`
 	DisplayName string    `gorm:"type:text;column:display_name" json:"display_name"`
 	AvatarUrl   string    `gorm:"type:text;column:avatar_url" json:"avatar_url"`
-	RawData     string    `gorm:"type:jsonb;column:raw_data" json:"raw_data"`
+	RawData     string    `gorm:"type:jsonb;column:raw_data" json:"-"`              // never expose — raw OAuth data may contain sensitive fields
 	CreatedAt   time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:created_at" json:"created_at"`
 }
 
