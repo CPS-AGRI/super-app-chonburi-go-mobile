@@ -43,10 +43,6 @@ func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domai
 	h.Write([]byte(req.IdentityNumber))
 	identityHash := hex.EncodeToString(h.Sum(nil))
 
-	h2 := sha256.New()
-	h2.Write([]byte(req.LaserID))
-	laserHash := hex.EncodeToString(h2.Sum(nil))
-
 	updates := map[string]interface{}{
 		"verification_status":       string(domain.VerificationStatusPending),
 		"id_card_type":              req.IdCardType,
@@ -54,8 +50,6 @@ func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domai
 		"id_card_expiry":            req.IdCardExpiry,
 		"identity_number_encrypted": "ENC_" + req.IdentityNumber,
 		"identity_number_hash":      identityHash,
-		"laser_id_encrypted":        "ENC_" + req.LaserID,
-		"laser_id_hash":             laserHash,
 		"prefix":                    req.Prefix,
 		"name":                      req.Name,
 		"last_name":                 req.LastName,

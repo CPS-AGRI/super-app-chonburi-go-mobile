@@ -27,7 +27,7 @@ func (UserFCMToken) TableName() string { return "user_fcm_tokens" }
 
 type SubmitVerificationRequest struct {
 	IdentityNumber string     `json:"identity_number" validate:"required"`
-	LaserID        string     `json:"laser_id"        validate:"required"`
+	LaserID        string     `json:"laser_id"`
 	IdCardType     int        `json:"id_card_type"    validate:"required,oneof=1 2"`
 	IdCardExpiry   *time.Time `json:"id_card_expiry"`
 	IdCardPhotoUrl string     `json:"id_card_photo_url" validate:"required"`

@@ -63,8 +63,8 @@ func (h *verificationHandler) Submit(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	if req.IdentityNumber == "" || req.LaserID == "" || req.IdCardPhotoUrl == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "identity_number, laser_id, and id_card_photo_url are required"})
+	if req.IdentityNumber == "" || req.IdCardPhotoUrl == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "identity_number and id_card_photo_url are required"})
 	}
 
 	if err := h.useCase.SubmitVerification(userID, &req); err != nil {
