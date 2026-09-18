@@ -24,8 +24,9 @@ WORKDIR /app
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S appgroup && adduser -S appuser -G appgroup
 
-# Copy compiled binary
+# Copy compiled binary and static assets
 COPY --from=builder /app/main .
+COPY --from=builder /app/assets ./assets
 
 # Set permissions
 RUN chown -R appuser:appgroup /app

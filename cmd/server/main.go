@@ -94,6 +94,8 @@ func main() {
 	cctvUseCase := usecase.NewCCTVUseCase(cctvRepo)
 	http.NewCCTVHandler(app, cctvUseCase, cfg)
 
+	http.NewDocumentHandler(app)
+
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")
 	})
