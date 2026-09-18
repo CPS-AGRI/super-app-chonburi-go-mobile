@@ -67,10 +67,12 @@ func formatThaiAddress(info *domain.UserInformation) string {
 		}
 	}
 	if info.Province != "" {
-		if isBkk {
-			addr += " " + info.Province
-		} else {
-			addr += " จ." + info.Province
+		if !strings.Contains(addr, "จ.") && !strings.Contains(addr, "จังหวัด") {
+			if isBkk {
+				addr += " " + info.Province
+			} else {
+				addr += " จ." + info.Province
+			}
 		}
 	}
 	if info.PostalCode > 0 {
