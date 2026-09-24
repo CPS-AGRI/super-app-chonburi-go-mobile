@@ -18,11 +18,11 @@ type UserOauthAccount struct {
 	ID          uuid.UUID `gorm:"type:uuid;primaryKey;default:uuid_generate_v4();column:id" json:"id"`
 	UserId      uuid.UUID `gorm:"type:uuid;not null;column:user_id" json:"user_id"`
 	Provider    string    `gorm:"type:text;not null;column:provider" json:"provider"` // google, facebook, line, apple
-	ProviderId  string    `gorm:"type:text;not null;column:provider_id" json:"provider_id"`
+	ProviderId  string    `gorm:"type:text;not null;column:provider_id" json:"-"`    // never expose — contains hashed PID for thaiid
 	Email       string    `gorm:"type:text;column:email" json:"email"`
 	DisplayName string    `gorm:"type:text;column:display_name" json:"display_name"`
 	AvatarUrl   string    `gorm:"type:text;column:avatar_url" json:"avatar_url"`
-	RawData     string    `gorm:"type:jsonb;column:raw_data" json:"raw_data"`
+	RawData     string    `gorm:"type:jsonb;column:raw_data" json:"-"`              // never expose — raw OAuth data may contain sensitive fields
 	CreatedAt   time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:created_at" json:"created_at"`
 }
 
@@ -65,9 +65,6 @@ type UserInformation struct {
 	IdentityNumberEncrypted string `gorm:"type:text;column:identity_number_encrypted" json:"-"`
 	IdentityNumberHash      string `gorm:"type:text;index;column:identity_number_hash" json:"-"`
 
-	LaserIdEncrypted string `gorm:"type:text;column:laser_id_encrypted" json:"-"`
-	LaserIdHash      string `gorm:"type:text;index;column:laser_id_hash" json:"-"`
-
 	IdCardType     *int       `gorm:"type:int4;column:id_card_type" json:"id_card_type"`
 	IdCardPhotoUrl *string    `gorm:"type:text;column:id_card_photo_url" json:"id_card_photo_url"`
 	IdCardExpiry   *time.Time `gorm:"type:date;column:id_card_expiry" json:"id_card_expiry"`
@@ -105,6 +102,36 @@ func (UserInformation) TableName() string {
 	return "user_informations"
 }
 
+type SocialAccountItem struct {
+	ID          string  `json:"id"`
+	Provider    string  `json:"provider"`
+	ProviderID  string  `json:"provider_id"`
+	Email       string  `json:"email"`
+	DisplayName string  `json:"display_name"`
+	AvatarURL   string  `json:"avatar_url"`
+	IsLinked    bool    `json:"is_linked"`
+	CreatedAt   *string `json:"created_at,omitempty"`
+}
+
+type SocialAccountsResponse struct {
+	Google   SocialAccountItem  `json:"google"`
+	Facebook SocialAccountItem  `json:"facebook"`
+	Line     SocialAccountItem  `json:"line"`
+	Apple    *SocialAccountItem `json:"apple,omitempty"`
+}
+
+type UnlinkSocialRequest struct {
+	Provider string `json:"provider" validate:"required"`
+}
+
+type LinkSocialRequest struct {
+	Provider    string `json:"provider" validate:"required"`
+	IDToken     string `json:"id_token,omitempty"`
+	AccessToken string `json:"access_token,omitempty"`
+	AuthCode    string `json:"auth_code,omitempty"`
+	RedirectURI string `json:"redirect_uri,omitempty"`
+}
+
 type AuthRepository interface {
 	GetByID(id uuid.UUID) (*AppUser, error)
 	GetByProviderID(provider, providerID string) (*AppUser, error)
@@ -114,7 +141,39 @@ type AuthRepository interface {
 	Update(user *AppUser) error
 	CreateOauthAccount(oauth *UserOauthAccount) error
 	UpdateOauthAccount(oauth *UserOauthAccount) error
+	DeleteOauthAccount(id uuid.UUID) error
 	Delete(user *AppUser) error
+	GetSocialLinks(userID uuid.UUID) (*SocialAccountsResponse, error)
+	UnlinkSocial(userID uuid.UUID, provider string) error
+	LinkSocialAccount(userID uuid.UUID, account *UserOauthAccount) error
+	UpdateProfileImage(userID uuid.UUID, imageURL string) error
+	GetExistingSocialProfile(userID uuid.UUID, provider string) (*UserOauthAccount, error)
+	BindOverrideSocialAccount(userID uuid.UUID, provider string, newOAuthID uuid.UUID) error
+}
+
+type SocialConflictError struct {
+	Provider            string `json:"provider"`
+	ExistingAccountName string `json:"existing_account_name"`
+	OAuthProfileID      string `json:"oauth_profile_id"`
+}
+
+func (e *SocialConflictError) Error() string {
+	return "SOCIAL_CONFLICT"
+}
+
+type OAuthLoginResponse struct {
+	Registered     bool              `json:"registered"`
+	OAuthProfileID string            `json:"oauth_profile_id,omitempty"`
+	AccessToken    string            `json:"access_token,omitempty"`
+	RefreshToken   string            `json:"refresh_token,omitempty"`
+	User           *AppUser          `json:"user,omitempty"`
+	Profile        *SocialAccountItem `json:"profile,omitempty"`
+}
+
+type BindOverrideRequest struct {
+	OAuthProfileID string `json:"oauth_profile_id" validate:"required"`
+	Phone          string `json:"phone" validate:"required"`
+	Pin            string `json:"pin" validate:"required"`
 }
 
 type OTPRequest struct {
@@ -140,8 +199,28 @@ type OTPVerifyResponse struct {
 }
 
 type RegisterRequest struct {
-	Pin       string `json:"pin"`
-	TempToken string `json:"temp_token"`
+	TempToken   string `json:"temp_token"`
+	Pin         string `json:"pin"`
+	DeviceID    string `json:"device_id"`
+	DeviceName  string `json:"device_name"`
+	Platform    string `json:"platform"`
+	IDCardHash  string `json:"id_card_hash"`
+	Prefix      string `json:"prefix"`
+	FirstName   string `json:"first_name"`
+	LastName    string `json:"last_name"`
+	Email       string `json:"email"`
+	Birthday    string `json:"birthday"`
+	HouseNumber string `json:"house_number"`
+	Building    string `json:"building"`
+	RoomNo      string `json:"room_no"`
+	Floor       string `json:"floor"`
+	Soi         string `json:"soi"`
+	VillageNo   string `json:"village_no"`
+	Road        string `json:"road"`
+	Province    string `json:"province"`
+	District    string `json:"district"`
+	SubDistrict string `json:"sub_district"`
+	PostalCode  string `json:"postal_code"`
 }
 
 type PinLoginRequest struct {
@@ -152,15 +231,25 @@ type PinLoginRequest struct {
 type AuthUseCase interface {
 	LoginWithGoogle(idToken string) (*AuthResponse, error)
 	LoginWithFacebook(accessToken string) (*AuthResponse, error)
+	LoginWithFacebookLimited(authToken string) (*AuthResponse, error)
 	LoginWithLine(code string, redirectURI string) (*AuthResponse, error)
 	LoginWithThaiID(code string, redirectURI string) (*AuthResponse, error)
+	BindThaiID(userID string, code string, redirectURI string) (*AuthResponse, error)
 	RefreshToken(refreshToken string) (*AuthResponse, error)
 	RequestOTP(phoneNumber string) (*OTPRequestResponse, error)
 	VerifyOTP(phoneNumber, otp, ref string) (*OTPVerifyResponse, error)
-	Register(pin, tempToken string) (*AuthResponse, error)
+	Register(req RegisterRequest) (*AuthResponse, error)
 	LoginWithPin(phoneNumber, pin string) (*AuthResponse, error)
 	BindPhone(provider, idToken, phoneNumber, otp, ref, pin string) (*AuthResponse, error)
+	BindOverrideGoogle(req BindOverrideRequest) (*AuthResponse, error)
+	BindOverrideFacebook(req BindOverrideRequest) (*AuthResponse, error)
+	BindOverrideLine(req BindOverrideRequest) (*AuthResponse, error)
+	BindOverrideApple(req BindOverrideRequest) (*AuthResponse, error)
 	CheckPhone(phoneNumber string) (bool, error)
+	GetSocialLinks(userID uuid.UUID) (*SocialAccountsResponse, error)
+	UnlinkSocial(userID uuid.UUID, provider string) error
+	LinkSocial(userID uuid.UUID, req LinkSocialRequest) error
+	UpdateProfileImage(userID uuid.UUID, imageURL string) error
 }
 
 type AuthResponse struct {

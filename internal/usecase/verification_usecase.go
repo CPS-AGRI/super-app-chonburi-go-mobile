@@ -1,8 +1,10 @@
 package usecase
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"super-app-chonburi-go-mobile/internal/domain"
 
@@ -21,6 +23,11 @@ func formatThaiAddress(info *domain.UserInformation) string {
 	if info == nil {
 		return ""
 	}
+	// หาก Subdistrict เป็นข้อความรวมที่อยู่เต็มมาจาก DOPA (มี "ต.", "อ.", "จ.", "แขวง", "เขต")
+	if strings.Contains(info.Subdistrict, "ต.") || strings.Contains(info.Subdistrict, "อ.") || strings.Contains(info.Subdistrict, "แขวง") || strings.Contains(info.Subdistrict, "เขต") {
+		return info.Subdistrict
+	}
+
 	var addr string
 	if info.HouseNumber != "" {
 		addr += info.HouseNumber
@@ -61,16 +68,18 @@ func formatThaiAddress(info *domain.UserInformation) string {
 		}
 	}
 	if info.Province != "" {
-		if isBkk {
-			addr += " " + info.Province
-		} else {
-			addr += " จ." + info.Province
+		if !strings.Contains(addr, "จ.") && !strings.Contains(addr, "จังหวัด") {
+			if isBkk {
+				addr += " " + info.Province
+			} else {
+				addr += " จ." + info.Province
+			}
 		}
 	}
 	if info.PostalCode > 0 {
 		addr += fmt.Sprintf(" %d", info.PostalCode)
 	}
-	return addr
+	return strings.TrimSpace(addr)
 }
 
 func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error) {
@@ -125,6 +134,30 @@ func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error
 		})
 	}
 
+	var registeredAddress string
+	for _, acc := range user.OauthAccounts {
+		if strings.ToLower(acc.Provider) == "thaiid" && acc.RawData != "" {
+			var profileMap map[string]interface{}
+			if err := json.Unmarshal([]byte(acc.RawData), &profileMap); err == nil {
+				hNo, vNo, al, rd, sub, dist, prov, pCode := parseThaiIDAddress(profileMap)
+				if hNo != "" || sub != "" || dist != "" || prov != "" {
+					dopaInfo := domain.UserInformation{
+						HouseNumber:   hNo,
+						VillageNumber: vNo,
+						Alley:         al,
+						Road:          rd,
+						Subdistrict:   sub,
+						District:      dist,
+						Province:      prov,
+						PostalCode:    pCode,
+					}
+					registeredAddress = formatThaiAddress(&dopaInfo)
+				}
+			}
+			break
+		}
+	}
+
 	return &domain.MeResponse{
 		UserID:             user.ID,
 		Name:               name,
@@ -135,6 +168,8 @@ func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error
 		ImageProfileUrl:    user.ImageProfileUrl,
 		VerificationStatus: verificationStatus,
 		MenuItems:          menuItems,
+		Information:        user.Information,
+		RegisteredAddress:  registeredAddress,
 	}, nil
 }
 
@@ -152,6 +187,10 @@ func (u *verificationUseCase) SubmitVerification(userID uuid.UUID, req *domain.S
 
 func (u *verificationUseCase) GetVerificationStatus(userID uuid.UUID) (*domain.VerificationStatusResponse, error) {
 	return u.repo.GetVerificationStatus(userID)
+}
+
+func (u *verificationUseCase) UpdateAddress(userID uuid.UUID, req *domain.UpdateAddressRequest) error {
+	return u.repo.UpdateAddress(userID, req)
 }
 
 func (u *verificationUseCase) RegisterFCMToken(userID uuid.UUID, req *domain.RegisterFCMTokenRequest) error {

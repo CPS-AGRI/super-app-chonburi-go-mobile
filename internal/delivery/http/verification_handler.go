@@ -1,12 +1,16 @@
 package http
 
 import (
+	"errors"
+	"strings"
+
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
 	"super-app-chonburi-go-mobile/pkg/jwtutil"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 type verificationHandler struct {
@@ -22,6 +26,7 @@ func NewVerificationHandler(app *fiber.App, useCase domain.VerificationUseCase, 
 
 	vGroup := app.Group("/api/v1/verification", jwtutil.RequireAuth(cfg))
 	vGroup.Post("/submit", handler.Submit)
+	vGroup.Put("/address", handler.UpdateAddress)
 	vGroup.Get("/status", handler.GetStatus)
 	vGroup.Post("/fcm-token", handler.RegisterFCMToken)
 
@@ -41,6 +46,9 @@ func (h *verificationHandler) Me(c fiber.Ctx) error {
 
 	res, err := h.useCase.GetMe(userID)
 	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) || strings.Contains(strings.ToLower(err.Error()), "record not found") {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "user not found or session expired"})
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -63,8 +71,8 @@ func (h *verificationHandler) Submit(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	if req.IdentityNumber == "" || req.LaserID == "" || req.IdCardPhotoUrl == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "identity_number, laser_id, and id_card_photo_url are required"})
+	if req.IdentityNumber == "" || req.IdCardPhotoUrl == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "identity_number and id_card_photo_url are required"})
 	}
 
 	if err := h.useCase.SubmitVerification(userID, &req); err != nil {
@@ -72,6 +80,29 @@ func (h *verificationHandler) Submit(c fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"success": true, "message": "verification request submitted successfully"})
+}
+
+func (h *verificationHandler) UpdateAddress(c fiber.Ctx) error {
+	userIDStr, err := jwtutil.ExtractUserID(c)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id format"})
+	}
+
+	var req domain.UpdateAddressRequest
+	if err := c.Bind().JSON(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	if err := h.useCase.UpdateAddress(userID, &req); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{"success": true, "message": "address updated successfully"})
 }
 
 func (h *verificationHandler) GetStatus(c fiber.Ctx) error {

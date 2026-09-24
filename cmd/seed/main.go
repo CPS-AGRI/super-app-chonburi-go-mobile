@@ -36,7 +36,6 @@ func main() {
 				Email:                   stringPtr("somchai@example.com"),
 				Phone:                   "0812345671",
 				IdentityNumberEncrypted: "ENC_1100112233441",
-				LaserIdEncrypted:        "ENC_ME0123456781",
 				Status:                  "active",
 				IsConsent:               true,
 			},

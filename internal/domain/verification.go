@@ -27,7 +27,6 @@ func (UserFCMToken) TableName() string { return "user_fcm_tokens" }
 
 type SubmitVerificationRequest struct {
 	IdentityNumber string     `json:"identity_number" validate:"required"`
-	LaserID        string     `json:"laser_id"        validate:"required"`
 	IdCardType     int        `json:"id_card_type"    validate:"required,oneof=1 2"`
 	IdCardExpiry   *time.Time `json:"id_card_expiry"`
 	IdCardPhotoUrl string     `json:"id_card_photo_url" validate:"required"`
@@ -79,12 +78,26 @@ type MeResponse struct {
 	ImageProfileUrl    *string            `json:"image_profile_url,omitempty"`
 	VerificationStatus string             `json:"verification_status"`
 	MenuItems          []MenuItemResponse `json:"menu_items"`
+	Information        *UserInformation   `json:"information,omitempty"`
+	RegisteredAddress  string             `json:"registered_address,omitempty"`
+}
+
+type UpdateAddressRequest struct {
+	HouseNumber   string `json:"house_number"`
+	VillageNumber string `json:"village_number"`
+	Alley         string `json:"alley"`
+	Road          string `json:"road"`
+	Subdistrict   string `json:"subdistrict"`
+	District      string `json:"district"`
+	Province      string `json:"province"`
+	PostalCode    int    `json:"postal_code"`
 }
 
 type VerificationRepository interface {
 	GetUserWithInfo(userID uuid.UUID) (*AppUser, error)
 	GetModulesForMenu() ([]Module, error)
 	SubmitVerification(userID uuid.UUID, req *SubmitVerificationRequest) error
+	UpdateAddress(userID uuid.UUID, req *UpdateAddressRequest) error
 	GetVerificationStatus(userID uuid.UUID) (*VerificationStatusResponse, error)
 	RegisterFCMToken(userID uuid.UUID, req *RegisterFCMTokenRequest) error
 	GetFCMTokensByUserID(userID uuid.UUID) ([]string, error)
@@ -93,6 +106,7 @@ type VerificationRepository interface {
 type VerificationUseCase interface {
 	GetMe(userID uuid.UUID) (*MeResponse, error)
 	SubmitVerification(userID uuid.UUID, req *SubmitVerificationRequest) error
+	UpdateAddress(userID uuid.UUID, req *UpdateAddressRequest) error
 	GetVerificationStatus(userID uuid.UUID) (*VerificationStatusResponse, error)
 	RegisterFCMToken(userID uuid.UUID, req *RegisterFCMTokenRequest) error
 }

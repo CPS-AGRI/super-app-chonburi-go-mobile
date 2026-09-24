@@ -26,6 +26,10 @@ type Config struct {
 	ThaiIDApiKey       string
 	ThaiIDRedirectURI  string
 
+	// Security: Thai citizen ID (PID) protection — PDPA compliance
+	PIDHmacSecret    string // HMAC-SHA256 key for PID hashing (lookup)
+	PIDEncryptionKey string // AES-256-GCM key (must be exactly 32 bytes in hex)
+
 	SMTPHost     string
 	SMTPPort     string
 	SMTPEmail    string
@@ -34,6 +38,17 @@ type Config struct {
 	TaxBillerID  string
 	TaxUploadDir string
 	MinIO        MinIOConfig
+
+	SMSGatewayURL string
+	SMSAPIKey     string
+	SMSAPISecret  string
+	SMSSenderName string
+
+	RedisHost     string
+	RedisPort     string
+	RedisAddr     string // host:port — ใช้ field นี้กับ RedisClient
+	RedisPassword string
+	RedisDB       int
 }
 
 type MinIOConfig struct {
@@ -129,6 +144,8 @@ func LoadConfig() *Config {
 		ThaiIDClientSecret: os.Getenv("THAIID_CLIENT_SECRET"),
 		ThaiIDApiKey:       os.Getenv("THAIID_API_KEY"),
 		ThaiIDRedirectURI:  os.Getenv("THAIID_REDIRECT_URI"),
+		PIDHmacSecret:     os.Getenv("PID_HMAC_SECRET"),
+		PIDEncryptionKey:  os.Getenv("PID_ENCRYPTION_KEY"),
 		SMTPHost:           os.Getenv("SMTP_HOST"),
 		SMTPPort:           os.Getenv("SMTP_PORT"),
 		SMTPEmail:          os.Getenv("SMTP_EMAIL"),
@@ -147,6 +164,31 @@ func LoadConfig() *Config {
 			PresignURLTTL:   minioPresignURLTTL,
 			MaxUploadSizeMB: minioMaxUploadSizeMB,
 		},
+		SMSGatewayURL: os.Getenv("SMS_GATEWAY_URL"),
+		SMSAPIKey:     os.Getenv("SMS_API_KEY"),
+		SMSAPISecret:  os.Getenv("SMS_API_SECRET"),
+		SMSSenderName: os.Getenv("SMS_SENDER_NAME"),
+		RedisHost: os.Getenv("REDIS_HOST"),
+		RedisPort: func() string {
+			p := os.Getenv("REDIS_PORT")
+			if p == "" {
+				p = "6379"
+			}
+			return p
+		}(),
+		RedisAddr: func() string {
+			host := os.Getenv("REDIS_HOST")
+			port := os.Getenv("REDIS_PORT")
+			if port == "" {
+				port = "6379"
+			}
+			return host + ":" + port
+		}(),
+		RedisPassword: os.Getenv("REDIS_PASSWORD"),
+		RedisDB: func() int {
+			db, _ := strconv.Atoi(os.Getenv("REDIS_DB"))
+			return db
+		}(),
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/delivery/http"
+	"super-app-chonburi-go-mobile/internal/infrastructure"
 	"super-app-chonburi-go-mobile/internal/repository"
 	"super-app-chonburi-go-mobile/internal/usecase"
 	"super-app-chonburi-go-mobile/pkg/database"
@@ -52,9 +53,13 @@ func main() {
 		AllowCredentials: false,
 	}))
 
+	smsClient := infrastructure.NewSMSClient(cfg.SMSGatewayURL, cfg.SMSAPIKey, cfg.SMSAPISecret, cfg.SMSSenderName)
+	redisClient, _ := infrastructure.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	uploadStorage := storage.NewMinIOStorage(minioClient)
+
 	authRepo := repository.NewAuthRepository(database.DB)
-	authUseCase := usecase.NewAuthUseCase(authRepo, cfg)
-	http.NewAuthHandler(app, authUseCase)
+	authUseCase := usecase.NewAuthUseCase(authRepo, cfg, smsClient, redisClient)
+	http.NewAuthHandler(app, authUseCase, cfg, uploadStorage)
 
 	complaintRepo := repository.NewComplaintRepository(database.DB)
 	complaintUseCase := usecase.NewComplaintUseCase(complaintRepo)
@@ -65,7 +70,6 @@ func main() {
 	http.NewModuleHandler(app, moduleUseCase)
 
 	mailSender := mail.NewSMTPEmailSender(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPEmail, cfg.SMTPPassword)
-	uploadStorage := storage.NewMinIOStorage(minioClient)
 	taxNewMobileRepo := repository.NewTaxNewMobileRepository(database.DB)
 	taxNewMobileUseCase := usecase.NewTaxNewMobileUseCase(taxNewMobileRepo, mailSender, cfg.TaxBillerID)
 	http.NewTaxNewMobileHandler(app, taxNewMobileUseCase, uploadStorage)
@@ -89,6 +93,8 @@ func main() {
 	cctvRepo := repository.NewCCTVRepository(database.DB)
 	cctvUseCase := usecase.NewCCTVUseCase(cctvRepo)
 	http.NewCCTVHandler(app, cctvUseCase, cfg)
+
+	http.NewDocumentHandler(app)
 
 	app.Get("/", func(c fiber.Ctx) error {
 		return c.SendString("Super App Chonburi Mobile API is running... 🚀")
