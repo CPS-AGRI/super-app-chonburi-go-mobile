@@ -55,10 +55,11 @@ func main() {
 
 	smsClient := infrastructure.NewSMSClient(cfg.SMSGatewayURL, cfg.SMSAPIKey, cfg.SMSAPISecret, cfg.SMSSenderName)
 	redisClient, _ := infrastructure.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	uploadStorage := storage.NewMinIOStorage(minioClient)
 
 	authRepo := repository.NewAuthRepository(database.DB)
 	authUseCase := usecase.NewAuthUseCase(authRepo, cfg, smsClient, redisClient)
-	http.NewAuthHandler(app, authUseCase)
+	http.NewAuthHandler(app, authUseCase, cfg, uploadStorage)
 
 	complaintRepo := repository.NewComplaintRepository(database.DB)
 	complaintUseCase := usecase.NewComplaintUseCase(complaintRepo)
@@ -69,7 +70,6 @@ func main() {
 	http.NewModuleHandler(app, moduleUseCase)
 
 	mailSender := mail.NewSMTPEmailSender(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPEmail, cfg.SMTPPassword)
-	uploadStorage := storage.NewMinIOStorage(minioClient)
 	taxNewMobileRepo := repository.NewTaxNewMobileRepository(database.DB)
 	taxNewMobileUseCase := usecase.NewTaxNewMobileUseCase(taxNewMobileRepo, mailSender, cfg.TaxBillerID)
 	http.NewTaxNewMobileHandler(app, taxNewMobileUseCase, uploadStorage)

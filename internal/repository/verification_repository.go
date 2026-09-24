@@ -22,7 +22,7 @@ func NewVerificationRepository(db *gorm.DB) domain.VerificationRepository {
 
 func (r *verificationRepository) GetUserWithInfo(userID uuid.UUID) (*domain.AppUser, error) {
 	var user domain.AppUser
-	err := r.db.Preload("Information").First(&user, "id = ?", userID).Error
+	err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, "id = ?", userID).Error
 	if err != nil {
 		return nil, err
 	}
@@ -43,8 +43,19 @@ func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domai
 	h.Write([]byte(req.IdentityNumber))
 	identityHash := hex.EncodeToString(h.Sum(nil))
 
+	var currentStatus string
+	_ = r.db.Model(&domain.UserInformation{}).
+		Select("verification_status").
+		Where("user_id = ?", userID).
+		Scan(&currentStatus)
+
+	targetStatus := string(domain.VerificationStatusPending)
+	if currentStatus == string(domain.VerificationStatusVerified) {
+		targetStatus = string(domain.VerificationStatusVerified)
+	}
+
 	updates := map[string]interface{}{
-		"verification_status":       string(domain.VerificationStatusPending),
+		"verification_status":       targetStatus,
 		"id_card_type":              req.IdCardType,
 		"id_card_photo_url":         req.IdCardPhotoUrl,
 		"id_card_expiry":            req.IdCardExpiry,
@@ -76,69 +87,71 @@ func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domai
 		return err
 	}
 
-	// Create admin notification
-	var moduleID uuid.UUID
-	_ = r.db.Table("modules").Select("id").Where("key = ? OR key = ?", "register", "ModuleIdentityVerifications").Limit(1).Scan(&moduleID)
-	if moduleID == uuid.Nil {
-		moduleID = uuid.MustParse("8c7ce421-5d1f-41de-840b-14ac192d4778") // Fallback valid Module ID (การยืนยันตัวตน)
-	}
-
-	var deptID string
-	_ = r.db.Table("department_modules").Select("department_id").Where("module_id = ?", moduleID).Limit(1).Scan(&deptID)
-
-	var deptUUID *uuid.UUID
-	if deptID != "" {
-		if parsed, err := uuid.Parse(deptID); err == nil {
-			deptUUID = &parsed
+	// Create admin notification if pending verification
+	if targetStatus == string(domain.VerificationStatusPending) {
+		var moduleID uuid.UUID
+		_ = r.db.Table("modules").Select("id").Where("key = ? OR key = ?", "register", "ModuleIdentityVerifications").Limit(1).Scan(&moduleID)
+		if moduleID == uuid.Nil {
+			moduleID = uuid.MustParse("8c7ce421-5d1f-41de-840b-14ac192d4778") // Fallback valid Module ID (การยืนยันตัวตน)
 		}
-	}
 
-	roleEmp := "Employees"
-	roleMgr := "Managers"
-	title := "มีคำขอยืนยันตัวตนใหม่"
-	body := "คำขอตรวจสอบการยืนยันตัวตนจากคุณ " + req.Name + " " + req.LastName
+		var deptID string
+		_ = r.db.Table("department_modules").Select("department_id").Where("module_id = ?", moduleID).Limit(1).Scan(&deptID)
 
-	// 1. Notification for Employees
-	newNotifEmp := domain.ModuleNotification{
-		ID:              uuid.New(),
-		ModuleID:        moduleID,
-		DepartmentID:    deptUUID,
-		Role:            &roleEmp,
-		ReferenceID:     userID.String(),
-		ReferenceTitle:  title,
-		ReferenceBody:   body,
-		ReferenceStatus: "pending",
-		Type:            "admin",
-		Status:          "published",
-		State:           "unread",
-		IsRead:          false,
-		CreatedBy:       "mobile_submit",
-		CreatedDate:     time.Now(),
-		UpdatedBy:       "mobile_submit",
-		UpdatedDate:     time.Now(),
-	}
-	_ = r.db.Create(&newNotifEmp)
+		var deptUUID *uuid.UUID
+		if deptID != "" {
+			if parsed, err := uuid.Parse(deptID); err == nil {
+				deptUUID = &parsed
+			}
+		}
 
-	// 2. Notification for Managers
-	newNotifMgr := domain.ModuleNotification{
-		ID:              uuid.New(),
-		ModuleID:        moduleID,
-		DepartmentID:    deptUUID,
-		Role:            &roleMgr,
-		ReferenceID:     userID.String(),
-		ReferenceTitle:  title,
-		ReferenceBody:   body,
-		ReferenceStatus: "pending",
-		Type:            "admin",
-		Status:          "published",
-		State:           "unread",
-		IsRead:          false,
-		CreatedBy:       "mobile_submit",
-		CreatedDate:     time.Now(),
-		UpdatedBy:       "mobile_submit",
-		UpdatedDate:     time.Now(),
+		roleEmp := "Employees"
+		roleMgr := "Managers"
+		title := "มีคำขอยืนยันตัวตนใหม่"
+		body := "คำขอตรวจสอบการยืนยันตัวตนจากคุณ " + req.Name + " " + req.LastName
+
+		// 1. Notification for Employees
+		newNotifEmp := domain.ModuleNotification{
+			ID:              uuid.New(),
+			ModuleID:        moduleID,
+			DepartmentID:    deptUUID,
+			Role:            &roleEmp,
+			ReferenceID:     userID.String(),
+			ReferenceTitle:  title,
+			ReferenceBody:   body,
+			ReferenceStatus: "pending",
+			Type:            "admin",
+			Status:          "published",
+			State:           "unread",
+			IsRead:          false,
+			CreatedBy:       "mobile_submit",
+			CreatedDate:     time.Now(),
+			UpdatedBy:       "mobile_submit",
+			UpdatedDate:     time.Now(),
+		}
+		_ = r.db.Create(&newNotifEmp)
+
+		// 2. Notification for Managers
+		newNotifMgr := domain.ModuleNotification{
+			ID:              uuid.New(),
+			ModuleID:        moduleID,
+			DepartmentID:    deptUUID,
+			Role:            &roleMgr,
+			ReferenceID:     userID.String(),
+			ReferenceTitle:  title,
+			ReferenceBody:   body,
+			ReferenceStatus: "pending",
+			Type:            "admin",
+			Status:          "published",
+			State:           "unread",
+			IsRead:          false,
+			CreatedBy:       "mobile_submit",
+			CreatedDate:     time.Now(),
+			UpdatedBy:       "mobile_submit",
+			UpdatedDate:     time.Now(),
+		}
+		_ = r.db.Create(&newNotifMgr)
 	}
-	_ = r.db.Create(&newNotifMgr)
 
 	return nil
 }
@@ -183,3 +196,38 @@ func (r *verificationRepository) GetFCMTokensByUserID(userID uuid.UUID) ([]strin
 	}
 	return result, nil
 }
+
+func (r *verificationRepository) UpdateAddress(userID uuid.UUID, req *domain.UpdateAddressRequest) error {
+	var count int64
+	r.db.Model(&domain.UserInformation{}).Where("user_id = ?", userID).Count(&count)
+	if count == 0 {
+		info := domain.UserInformation{
+			UserId:        userID,
+			HouseNumber:   req.HouseNumber,
+			VillageNumber: req.VillageNumber,
+			Alley:         req.Alley,
+			Road:          req.Road,
+			Subdistrict:   req.Subdistrict,
+			District:      req.District,
+			Province:      req.Province,
+			PostalCode:    req.PostalCode,
+			CreatedDate:   time.Now(),
+			UpdatedDate:   time.Now(),
+		}
+		return r.db.Create(&info).Error
+	}
+
+	updates := map[string]interface{}{
+		"house_number":   req.HouseNumber,
+		"village_number": req.VillageNumber,
+		"alley":          req.Alley,
+		"road":           req.Road,
+		"subdistrict":    req.Subdistrict,
+		"district":       req.District,
+		"province":       req.Province,
+		"postal_code":    req.PostalCode,
+		"updated_date":   time.Now(),
+	}
+	return r.db.Model(&domain.UserInformation{}).Where("user_id = ?", userID).Updates(updates).Error
+}
+

@@ -82,6 +82,42 @@ func (m *MockAuthRepository) DeleteOauthAccount(id uuid.UUID) error {
 	return args.Error(0)
 }
 
+func (m *MockAuthRepository) GetSocialLinks(userID uuid.UUID) (*domain.SocialAccountsResponse, error) {
+	args := m.Called(userID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*domain.SocialAccountsResponse), args.Error(1)
+}
+
+func (m *MockAuthRepository) UnlinkSocial(userID uuid.UUID, provider string) error {
+	args := m.Called(userID, provider)
+	return args.Error(0)
+}
+
+func (m *MockAuthRepository) LinkSocialAccount(userID uuid.UUID, account *domain.UserOauthAccount) error {
+	args := m.Called(userID, account)
+	return args.Error(0)
+}
+
+func (m *MockAuthRepository) UpdateProfileImage(userID uuid.UUID, imageURL string) error {
+	args := m.Called(userID, imageURL)
+	return args.Error(0)
+}
+
+func (m *MockAuthRepository) GetExistingSocialProfile(userID uuid.UUID, provider string) (*domain.UserOauthAccount, error) {
+	args := m.Called(userID, provider)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*domain.UserOauthAccount), args.Error(1)
+}
+
+func (m *MockAuthRepository) BindOverrideSocialAccount(userID uuid.UUID, provider string, newOAuthID uuid.UUID) error {
+	args := m.Called(userID, provider, newOAuthID)
+	return args.Error(0)
+}
+
 // MockSMSService implements infrastructure.SMSService for testing
 type MockSMSService struct {
 	mock.Mock
@@ -164,7 +200,6 @@ func TestRegister_Success_FullPayload(t *testing.T) {
 		Email:       "somchai@example.com",
 		Birthday:    "1995-05-15",
 		IDCardHash:  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-		LaserIDHash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
 		Province:    "ชลบุรี",
 	}
 

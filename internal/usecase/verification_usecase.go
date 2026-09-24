@@ -1,6 +1,7 @@
 package usecase
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -133,6 +134,30 @@ func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error
 		})
 	}
 
+	var registeredAddress string
+	for _, acc := range user.OauthAccounts {
+		if strings.ToLower(acc.Provider) == "thaiid" && acc.RawData != "" {
+			var profileMap map[string]interface{}
+			if err := json.Unmarshal([]byte(acc.RawData), &profileMap); err == nil {
+				hNo, vNo, al, rd, sub, dist, prov, pCode := parseThaiIDAddress(profileMap)
+				if hNo != "" || sub != "" || dist != "" || prov != "" {
+					dopaInfo := domain.UserInformation{
+						HouseNumber:   hNo,
+						VillageNumber: vNo,
+						Alley:         al,
+						Road:          rd,
+						Subdistrict:   sub,
+						District:      dist,
+						Province:      prov,
+						PostalCode:    pCode,
+					}
+					registeredAddress = formatThaiAddress(&dopaInfo)
+				}
+			}
+			break
+		}
+	}
+
 	return &domain.MeResponse{
 		UserID:             user.ID,
 		Name:               name,
@@ -143,6 +168,8 @@ func (u *verificationUseCase) GetMe(userID uuid.UUID) (*domain.MeResponse, error
 		ImageProfileUrl:    user.ImageProfileUrl,
 		VerificationStatus: verificationStatus,
 		MenuItems:          menuItems,
+		Information:        user.Information,
+		RegisteredAddress:  registeredAddress,
 	}, nil
 }
 
@@ -160,6 +187,10 @@ func (u *verificationUseCase) SubmitVerification(userID uuid.UUID, req *domain.S
 
 func (u *verificationUseCase) GetVerificationStatus(userID uuid.UUID) (*domain.VerificationStatusResponse, error) {
 	return u.repo.GetVerificationStatus(userID)
+}
+
+func (u *verificationUseCase) UpdateAddress(userID uuid.UUID, req *domain.UpdateAddressRequest) error {
+	return u.repo.UpdateAddress(userID, req)
 }
 
 func (u *verificationUseCase) RegisterFCMToken(userID uuid.UUID, req *domain.RegisterFCMTokenRequest) error {

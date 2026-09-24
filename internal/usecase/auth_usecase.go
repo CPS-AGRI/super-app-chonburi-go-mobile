@@ -18,6 +18,8 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,13 +31,68 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
-	"google.golang.org/api/idtoken"
 )
 
+// Dedicated resilient HTTP client for third-party OAuth providers (Google, Facebook, LINE, Apple, ThaiID)
+var oauthHTTPClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	},
+}
+
+func verifyGoogleIDToken(idToken string, expectedClientID ...string) (googleID, email, name, picture, rawData string, err error) {
+	url := fmt.Sprintf("https://oauth2.googleapis.com/tokeninfo?id_token=%s", idToken)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", "", "", "", "", fmt.Errorf("failed to create validation request: %w", err)
+	}
+
+	resp, err := oauthHTTPClient.Do(req)
+	if err != nil {
+		return "", "", "", "", "", fmt.Errorf("failed to call Google Token Info: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", "", "", "", errors.New("invalid google token")
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", "", "", "", fmt.Errorf("failed to read google response: %w", err)
+	}
+
+	var payload struct {
+		Aud     string `json:"aud"`
+		Sub     string `json:"sub"`
+		Email   string `json:"email"`
+		Name    string `json:"name"`
+		Picture string `json:"picture"`
+	}
+	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
+		return "", "", "", "", "", fmt.Errorf("failed to parse google token payload: %w", err)
+	}
+
+	if len(expectedClientID) > 0 && expectedClientID[0] != "" {
+		if payload.Aud != expectedClientID[0] {
+			return "", "", "", "", "", fmt.Errorf("google token audience mismatch: expected %s, got %s", expectedClientID[0], payload.Aud)
+		}
+	}
+
+	return payload.Sub, payload.Email, payload.Name, payload.Picture, string(bodyBytes), nil
+}
+
 type otpData struct {
-	Code      string
-	Ref       string
-	ExpiresAt time.Time
+	Code      string    `json:"code"`
+	Ref       string    `json:"ref"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 type authUseCase struct {
@@ -58,19 +115,10 @@ func NewAuthUseCase(repo domain.AuthRepository, cfg *config.Config, smsClient in
 }
 
 func (u *authUseCase) LoginWithGoogle(idToken string) (*domain.AuthResponse, error) {
-
-	payload, err := idtoken.Validate(context.Background(), idToken, "")
+	googleID, email, name, picture, rawDataStr, err := verifyGoogleIDToken(idToken, u.config.GoogleClientID)
 	if err != nil {
-		return nil, errors.New("invalid google token")
+		return nil, err
 	}
-
-	email := payload.Claims["email"].(string)
-	googleID := payload.Subject
-	name := payload.Claims["name"].(string)
-	picture := payload.Claims["picture"].(string)
-
-	claimsBytes, _ := json.Marshal(payload.Claims)
-	rawDataStr := string(claimsBytes)
 
 	user, err := u.repo.GetByProviderID("google", googleID)
 	if err != nil {
@@ -126,6 +174,43 @@ func (u *authUseCase) LoginWithGoogle(idToken string) (*domain.AuthResponse, err
 				return nil, err
 			}
 			user.OauthAccounts = append(user.OauthAccounts, *oauthAcc)
+
+			// อัปเดตข้อมูลผู้ใช้เดิมหากชื่อหรือรูปยังเป็นค่าเริ่มต้น
+			userUpdated := false
+			if user.Information != nil && isPlaceholderName(user.Information.Name) {
+				firstName := name
+				lastName := ""
+				for i, char := range name {
+					if char == ' ' {
+						firstName = name[:i]
+						lastName = name[i+1:]
+						break
+					}
+				}
+				user.Information.Name = firstName
+				if lastName != "" || isPlaceholderLastName(user.Information.LastName) {
+					user.Information.LastName = lastName
+				}
+				userUpdated = true
+			}
+			if picture != "" && (user.ImageProfileUrl == nil || *user.ImageProfileUrl == "") {
+				user.ImageProfileUrl = &picture
+				userUpdated = true
+			}
+			if email != "" && (user.Email == nil || *user.Email == "") {
+				user.Email = &email
+				if user.Information != nil {
+					user.Information.Email = &email
+				}
+				userUpdated = true
+			}
+			if userUpdated {
+				user.UpdatedDate = time.Now()
+				if user.Information != nil {
+					user.Information.UpdatedDate = time.Now()
+				}
+				_ = u.repo.Update(user)
+			}
 		}
 	}
 
@@ -202,7 +287,7 @@ func getFacebookPublicKey(kid string) (*rsa.PublicKey, error) {
 		}
 	}
 
-	resp, err := http.Get("https://limited.facebook.com/.well-known/oauth/openid/jwks/")
+	resp, err := oauthHTTPClient.Get("https://limited.facebook.com/.well-known/oauth/openid/jwks/")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch facebook jwks: %w", err)
 	}
@@ -250,6 +335,108 @@ func verifyFacebookLimitedToken(authToken string) (*fbLimitedClaims, error) {
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid facebook limited login token: %w", err)
 	}
+	return claims, nil
+}
+
+// --- Apple JWKS Caching (24h TTL) ---
+var (
+	appleJwksCache    map[string]*rsa.PublicKey
+	appleJwksMu       sync.RWMutex
+	appleJwksExpireAt time.Time
+)
+
+type appleClaims struct {
+	Iss           string      `json:"iss"`
+	Aud           string      `json:"aud"`
+	Exp           int64       `json:"exp"`
+	Iat           int64       `json:"iat"`
+	Sub           string      `json:"sub"`
+	Email         string      `json:"email"`
+	EmailVerified interface{} `json:"email_verified"`
+	jwt.RegisteredClaims
+}
+
+func getApplePublicKey(kid string) (*rsa.PublicKey, error) {
+	appleJwksMu.RLock()
+	if time.Now().Before(appleJwksExpireAt) && appleJwksCache != nil {
+		pubKey, ok := appleJwksCache[kid]
+		appleJwksMu.RUnlock()
+		if ok {
+			return pubKey, nil
+		}
+	} else {
+		appleJwksMu.RUnlock()
+	}
+
+	appleJwksMu.Lock()
+	defer appleJwksMu.Unlock()
+
+	if time.Now().Before(appleJwksExpireAt) && appleJwksCache != nil {
+		if pubKey, ok := appleJwksCache[kid]; ok {
+			return pubKey, nil
+		}
+	}
+
+	resp, err := oauthHTTPClient.Get("https://appleid.apple.com/auth/keys")
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch apple jwks: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		return nil, fmt.Errorf("failed to decode apple jwks: %w", err)
+	}
+
+	newCache := make(map[string]*rsa.PublicKey)
+	for _, k := range jwks.Keys {
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil {
+			continue
+		}
+		n := new(big.Int).SetBytes(nBytes)
+		e := int(new(big.Int).SetBytes(eBytes).Int64())
+		newCache[k.Kid] = &rsa.PublicKey{N: n, E: e}
+	}
+
+	appleJwksCache = newCache
+	appleJwksExpireAt = time.Now().Add(24 * time.Hour)
+
+	pubKey, ok := appleJwksCache[kid]
+	if !ok {
+		return nil, fmt.Errorf("no apple public key found for kid: %s", kid)
+	}
+	return pubKey, nil
+}
+
+func verifyAppleIDToken(idToken string) (*appleClaims, error) {
+	claims := &appleClaims{}
+	token, err := jwt.ParseWithClaims(idToken, claims, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected apple signing method: %v", t.Header["alg"])
+		}
+		kid, _ := t.Header["kid"].(string)
+		return getApplePublicKey(kid)
+	})
+	if err != nil || !token.Valid {
+		return nil, fmt.Errorf("invalid apple identity token: %w", err)
+	}
+
+	if claims.Iss != "https://appleid.apple.com" {
+		return nil, errors.New("invalid apple token issuer")
+	}
+
 	return claims, nil
 }
 
@@ -371,7 +558,7 @@ func (u *authUseCase) LoginWithFacebookLimited(authToken string) (*domain.AuthRe
 
 func (u *authUseCase) LoginWithFacebook(accessToken string) (*domain.AuthResponse, error) {
 	// Call Facebook Graph API to verify token and retrieve profile info
-	resp, err := http.Get(fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", accessToken))
+	resp, err := oauthHTTPClient.Get(fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", accessToken))
 	if err != nil {
 		return nil, fmt.Errorf("failed to call facebook api: %w", err)
 	}
@@ -490,6 +677,43 @@ func (u *authUseCase) LoginWithFacebook(accessToken string) (*domain.AuthRespons
 				return nil, err
 			}
 			user.OauthAccounts = append(user.OauthAccounts, *oauthAcc)
+
+			// อัปเดตข้อมูลผู้ใช้เดิมหากชื่อหรือรูปยังเป็นค่าเริ่มต้น
+			userUpdated := false
+			if user.Information != nil && isPlaceholderName(user.Information.Name) {
+				firstName := fbProfile.Name
+				lastName := ""
+				for i, char := range fbProfile.Name {
+					if char == ' ' {
+						firstName = fbProfile.Name[:i]
+						lastName = fbProfile.Name[i+1:]
+						break
+					}
+				}
+				user.Information.Name = firstName
+				if lastName != "" || isPlaceholderLastName(user.Information.LastName) {
+					user.Information.LastName = lastName
+				}
+				userUpdated = true
+			}
+			if picture != "" && (user.ImageProfileUrl == nil || *user.ImageProfileUrl == "") {
+				user.ImageProfileUrl = &picture
+				userUpdated = true
+			}
+			if fbProfile.Email != "" && (user.Email == nil || *user.Email == "") {
+				user.Email = &fbProfile.Email
+				if user.Information != nil {
+					user.Information.Email = &fbProfile.Email
+				}
+				userUpdated = true
+			}
+			if userUpdated {
+				user.UpdatedDate = time.Now()
+				if user.Information != nil {
+					user.Information.UpdatedDate = time.Now()
+				}
+				_ = u.repo.Update(user)
+			}
 		}
 	}
 
@@ -527,15 +751,19 @@ func (u *authUseCase) LoginWithLine(codeOrToken string, redirectURI string) (*do
 		tokenData.Set("client_id", u.config.LineChannelID)
 		tokenData.Set("client_secret", u.config.LineChannelSecret)
 
-		tokenResp, err := http.PostForm("https://api.line.me/oauth2/v2.1/token", tokenData)
-		if err == nil && tokenResp.StatusCode == http.StatusOK {
-			var tokenResult struct {
-				AccessToken string `json:"access_token"`
+		tokenReq, reqErr := http.NewRequest(http.MethodPost, "https://api.line.me/oauth2/v2.1/token", strings.NewReader(tokenData.Encode()))
+		if reqErr == nil {
+			tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			tokenResp, err := oauthHTTPClient.Do(tokenReq)
+			if err == nil && tokenResp.StatusCode == http.StatusOK {
+				var tokenResult struct {
+					AccessToken string `json:"access_token"`
+				}
+				if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err == nil && tokenResult.AccessToken != "" {
+					lineAccessToken = tokenResult.AccessToken
+				}
+				tokenResp.Body.Close()
 			}
-			if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err == nil && tokenResult.AccessToken != "" {
-				lineAccessToken = tokenResult.AccessToken
-			}
-			tokenResp.Body.Close()
 		}
 	}
 
@@ -546,7 +774,7 @@ func (u *authUseCase) LoginWithLine(codeOrToken string, redirectURI string) (*do
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", lineAccessToken))
 
-	profileResp, err := http.DefaultClient.Do(req)
+	profileResp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch line profile: %w", err)
 	}
@@ -663,13 +891,12 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
 
-	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", u.config.ThaiIDClientID, u.config.ThaiIDClientSecret)))
+	basicAuth := base64.StdEncoding.EncodeToString([]byte(u.config.ThaiIDClientID + ":" + u.config.ThaiIDClientSecret))
 	reqToken.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	reqToken.Header.Set("Authorization", fmt.Sprintf("Basic %s", basicAuth))
 	reqToken.Header.Set("x-api-key", u.config.ThaiIDApiKey)
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	respToken, err := client.Do(reqToken)
+	respToken, err := oauthHTTPClient.Do(reqToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute token request: %w", err)
 	}
@@ -758,32 +985,7 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 		}
 
 		// Parse address from house_address or address
-		var houseNumber, villageNumber, alley, road, subdistrict, district, province string
-		if houseAddrMap, ok := thaiIDProfile["house_address"].(map[string]interface{}); ok {
-			if rawAddr, ok := houseAddrMap["raw"].(string); ok && rawAddr != "" {
-				parts := strings.Split(rawAddr, "#")
-				if len(parts) > 0 { houseNumber = parts[0] }
-				if len(parts) > 1 { villageNumber = parts[1] }
-				if len(parts) > 2 { alley = parts[2] }
-				if len(parts) > 3 && parts[3] != "" {
-					if alley == "" {
-						alley = parts[3]
-					} else {
-						alley = alley + " " + parts[3]
-					}
-				}
-				if len(parts) > 4 { road = parts[4] }
-				if len(parts) > 5 { subdistrict = parts[5] }
-				if len(parts) > 6 { district = parts[6] }
-				if len(parts) > 7 { province = parts[7] }
-			}
-		} else if addrMap, ok := thaiIDProfile["address"].(map[string]interface{}); ok {
-			if formattedAddr, ok := addrMap["formatted"].(string); ok {
-				subdistrict = formattedAddr
-			}
-		} else if addrStr, ok := thaiIDProfile["address"].(string); ok && addrStr != "" {
-			subdistrict = addrStr
-		}
+		houseNumber, villageNumber, alley, road, subdistrict, district, province, postalCode := parseThaiIDAddress(thaiIDProfile)
 
 		// Secure hash and encrypt PID — PDPA compliance
 		identityHash := hmacSHA256(pid, u.config.PIDHmacSecret)
@@ -798,6 +1000,9 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 		user = &domain.AppUser{
 			ID:              newUserID,
 			PhoneNumber:     "", // OAuth registration registers phone later or leaves empty
+			PhoneNumberHash: "",
+			PinHash:         "",
+			ImageProfileUrl: nil,
 			IsConsent:       true,
 			CreatedBy:       "system",
 			CreatedDate:     time.Now(),
@@ -808,9 +1013,10 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 					ID:          uuid.New(),
 					UserId:      newUserID,
 					Provider:    "thaiid",
-					ProviderId:  pidHash, // stored as HMAC hash — never raw PID
+					ProviderId:  pidHash, // Stored as HMAC hash
 					DisplayName: displayName,
-					RawData:     rawDataStr, // PID already stripped from this
+					AvatarUrl:   "",
+					RawData:     rawDataStr,
 					CreatedAt:   time.Now(),
 				},
 			},
@@ -826,7 +1032,7 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 				IdCardType:              &idCardTypeVal,
 				IdCardExpiry:            idCardExpiry,
 				Status:                  "active",
-				VerificationStatus:      "verified", // Verified automatically by ThaiID
+				VerificationStatus:      "verified",
 				VerifiedDate:            func() *time.Time { t := time.Now(); return &t }(),
 				HouseNumber:             houseNumber,
 				VillageNumber:           villageNumber,
@@ -835,6 +1041,7 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 				Subdistrict:             subdistrict,
 				District:                district,
 				Province:                province,
+				PostalCode:              postalCode,
 				IsConsent:               true,
 				CreatedBy:               "system",
 				CreatedDate:             time.Now(),
@@ -845,6 +1052,34 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 		err = u.repo.Create(user)
 		if err != nil {
 			return nil, err
+		}
+	} else if user != nil && user.Information != nil {
+		userUpdated := false
+		if isPlaceholderName(user.Information.Name) {
+			givenName, _ := thaiIDProfile["given_name"].(string)
+			familyName, _ := thaiIDProfile["family_name"].(string)
+			if givenName != "" {
+				user.Information.Name = givenName
+				userUpdated = true
+			}
+			if familyName != "" {
+				user.Information.LastName = familyName
+				userUpdated = true
+			} else if isPlaceholderLastName(user.Information.LastName) {
+				user.Information.LastName = ""
+				userUpdated = true
+			}
+		}
+		if user.Information.VerificationStatus != "verified" {
+			user.Information.VerificationStatus = "verified"
+			now := time.Now()
+			user.Information.VerifiedDate = &now
+			userUpdated = true
+		}
+		if userUpdated {
+			user.UpdatedDate = time.Now()
+			user.Information.UpdatedDate = time.Now()
+			_ = u.repo.Update(user)
 		}
 	}
 
@@ -867,7 +1102,51 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 }
 
 func (u *authUseCase) RefreshToken(refreshToken string) (*domain.AuthResponse, error) {
-	return nil, errors.New("refresh token not implemented yet")
+	token, err := jwt.Parse(refreshToken, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return []byte(u.config.JWTSecret), nil
+	})
+	if err != nil || !token.Valid {
+		return nil, errors.New("invalid or expired refresh token")
+	}
+
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return nil, errors.New("invalid token claims")
+	}
+
+	userIDStr, ok := claims["user_id"].(string)
+	if !ok || userIDStr == "" {
+		return nil, errors.New("user_id not found in token")
+	}
+
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return nil, errors.New("invalid user_id in token")
+	}
+
+	user, err := u.repo.GetByID(userID)
+	if err != nil || user == nil {
+		return nil, errors.New("user not found")
+	}
+
+	newAccessToken, err := u.generateAccessToken(user)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate access token: %w", err)
+	}
+
+	newRefreshToken, err := u.generateRefreshToken(user)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate refresh token: %w", err)
+	}
+
+	return &domain.AuthResponse{
+		AccessToken:  newAccessToken,
+		RefreshToken: newRefreshToken,
+		User:         user,
+	}, nil
 }
 
 func (u *authUseCase) generateAccessToken(user *domain.AppUser) (string, error) {
@@ -879,7 +1158,7 @@ func (u *authUseCase) generateAccessToken(user *domain.AppUser) (string, error) 
 	claims := jwt.MapClaims{
 		"user_id": user.ID.String(),
 		"email":   email,
-		"exp":     time.Now().Add(time.Hour * 24).Unix(),
+		"exp":     time.Now().Add(time.Hour * 2).Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(u.config.JWTSecret))
@@ -899,6 +1178,18 @@ func stringPtr(s string) *string {
 }
 
 func (u *authUseCase) RequestOTP(phoneNumber string) (*domain.OTPRequestResponse, error) {
+	// Rate limiting / Cooldown check (60s)
+	cooldownKey := fmt.Sprintf("otp:cooldown:%s", phoneNumber)
+	otpKey := fmt.Sprintf("otp:%s", phoneNumber)
+	ctx := context.Background()
+
+	if u.redisClient != nil {
+		acquired, err := u.redisClient.AcquireLock(ctx, cooldownKey, 60*time.Second)
+		if err == nil && !acquired {
+			return nil, errors.New("กรุณารอ 60 วินาทีก่อนขอ OTP ใหม่อีกครั้ง (cooldown)")
+		}
+	}
+
 	// เจนรหัส OTP 6 หลัก
 	n, err := rand.Int(rand.Reader, big.NewInt(900000))
 	if err != nil {
@@ -918,14 +1209,25 @@ func (u *authUseCase) RequestOTP(phoneNumber string) (*domain.OTPRequestResponse
 	}
 	ref := string(refBytes)
 
-	// บันทึกใส่ Memory Store
-	u.otpMu.Lock()
-	u.otpStore[phoneNumber] = otpData{
+	data := otpData{
 		Code:      otpCode,
 		Ref:       ref,
 		ExpiresAt: time.Now().Add(5 * time.Minute),
 	}
-	u.otpMu.Unlock()
+
+	// บันทึกใส่ Redis (พร้อม fallback ลง in-memory store)
+	if u.redisClient != nil {
+		if err := u.redisClient.SetJSON(ctx, otpKey, data, 5*time.Minute); err != nil {
+			log.Printf("⚠️ [OTP Redis Warning] Failed to store OTP in Redis: %v. Falling back to in-memory store.", err)
+			u.otpMu.Lock()
+			u.otpStore[phoneNumber] = data
+			u.otpMu.Unlock()
+		}
+	} else {
+		u.otpMu.Lock()
+		u.otpStore[phoneNumber] = data
+		u.otpMu.Unlock()
+	}
 
 	// พิมพ์รหัสออกหน้าจอ console เพื่อการทดสอบใน local dev
 	log.Printf("📱 [OTP Debug] Phone: %s -> OTP: %s, Ref: %s (Expires in 5m)", phoneNumber, otpCode, ref)
@@ -945,15 +1247,35 @@ func (u *authUseCase) RequestOTP(phoneNumber string) (*domain.OTPRequestResponse
 }
 
 func (u *authUseCase) VerifyOTP(phoneNumber, otp, ref string) (*domain.OTPVerifyResponse, error) {
-	u.otpMu.RLock()
-	stored, exists := u.otpStore[phoneNumber]
-	u.otpMu.RUnlock()
+	var stored otpData
+	found := false
+	ctx := context.Background()
+	otpKey := fmt.Sprintf("otp:%s", phoneNumber)
 
-	if !exists {
+	if u.redisClient != nil {
+		if err := u.redisClient.GetJSON(ctx, otpKey, &stored); err == nil && stored.Code != "" {
+			found = true
+		}
+	}
+
+	if !found {
+		u.otpMu.RLock()
+		s, exists := u.otpStore[phoneNumber]
+		u.otpMu.RUnlock()
+		if exists {
+			stored = s
+			found = true
+		}
+	}
+
+	if !found {
 		return nil, errors.New("OTP verification code not found or expired")
 	}
 
 	if time.Now().After(stored.ExpiresAt) {
+		if u.redisClient != nil {
+			_ = u.redisClient.Delete(ctx, otpKey)
+		}
 		u.otpMu.Lock()
 		delete(u.otpStore, phoneNumber)
 		u.otpMu.Unlock()
@@ -965,6 +1287,9 @@ func (u *authUseCase) VerifyOTP(phoneNumber, otp, ref string) (*domain.OTPVerify
 	}
 
 	// ลบ OTP ออกจาก store เมื่อตรวจสอบผ่านสำเร็จ 100%
+	if u.redisClient != nil {
+		_ = u.redisClient.Delete(ctx, otpKey)
+	}
 	u.otpMu.Lock()
 	delete(u.otpStore, phoneNumber)
 	u.otpMu.Unlock()
@@ -1047,9 +1372,6 @@ func (u *authUseCase) Register(req domain.RegisterRequest) (*domain.AuthResponse
 	if req.IDCardHash != "" && !isValidSHA256(req.IDCardHash) {
 		return nil, errors.New("invalid id_card_hash format")
 	}
-	if req.LaserIDHash != "" && !isValidSHA256(req.LaserIDHash) {
-		return nil, errors.New("invalid laser_id_hash format")
-	}
 
 	// เข้ารหัส PIN
 	hashedPin, err := bcrypt.GenerateFromPassword([]byte(req.Pin), bcrypt.DefaultCost)
@@ -1093,9 +1415,9 @@ func (u *authUseCase) Register(req domain.RegisterRequest) (*domain.AuthResponse
 			Phone:              phoneNumber,
 			Birthday:           birthday,
 			IdentityNumberHash: req.IDCardHash,
-			LaserIdHash:        req.LaserIDHash,
 			Status:             "active",
 			VerificationStatus: "unverified",
+			HouseNumber:        req.HouseNumber,
 			BuildingName:       req.Building,
 			RoomNumber:         req.RoomNo,
 			Alley:              req.Soi,
@@ -1104,6 +1426,7 @@ func (u *authUseCase) Register(req domain.RegisterRequest) (*domain.AuthResponse
 			Province:           req.Province,
 			District:           req.District,
 			Subdistrict:        req.SubDistrict,
+			PostalCode:         func() int { p, _ := strconv.Atoi(req.PostalCode); return p }(),
 			IsConsent:          true,
 			CreatedBy:          "registration_flow",
 			CreatedDate:        time.Now(),
@@ -1182,6 +1505,184 @@ func hmacSHA256(value, secret string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
+func isPlaceholderName(name string) bool {
+	cleanName := strings.TrimSpace(name)
+	return cleanName == "" || cleanName == "ผู้ใช้ชลบุรีพลัส" || cleanName == "User" || strings.HasPrefix(cleanName, "ผู้ใช้")
+}
+
+func isPlaceholderLastName(lastName string) bool {
+	cleanLast := strings.TrimSpace(lastName)
+	return cleanLast == "" || strings.HasPrefix(cleanLast, "เบอร์ ") || strings.HasPrefix(cleanLast, "เบอร์")
+}
+
+type ParsedThaiAddress struct {
+	HouseNumber   string
+	VillageNumber string
+	Alley         string
+	Road          string
+	Subdistrict   string
+	District      string
+	Province      string
+	PostalCode    int
+}
+
+// parseThaiAddressString แยกที่อยู่ภาษาไทยแบบข้อความรวมออกเป็นฟิลด์มาตรฐาน
+func parseThaiAddressString(raw string) ParsedThaiAddress {
+	var res ParsedThaiAddress
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return res
+	}
+
+	// 1. รหัสไปรษณีย์ 5 หลัก
+	rePost := regexp.MustCompile(`\b([1-9][0-9]{4})\b`)
+	if match := rePost.FindStringSubmatch(raw); len(match) > 1 {
+		res.PostalCode, _ = strconv.Atoi(match[1])
+		raw = rePost.ReplaceAllString(raw, " ")
+	}
+
+	// 2. จังหวัด (จ. / จังหวัด / กรุงเทพฯ / กรุงเทพมหานคร / กทม)
+	reProv := regexp.MustCompile(`(?:จังหวัด|จ\.)\s*([ก-๙]+)`)
+	if match := reProv.FindStringSubmatch(raw); len(match) > 1 {
+		res.Province = strings.TrimSpace(match[1])
+		raw = reProv.ReplaceAllString(raw, " ")
+	} else if strings.Contains(raw, "กรุงเทพมหานคร") {
+		res.Province = "กรุงเทพมหานคร"
+		raw = strings.Replace(raw, "กรุงเทพมหานคร", " ", 1)
+	} else if strings.Contains(raw, "กรุงเทพฯ") {
+		res.Province = "กรุงเทพมหานคร"
+		raw = strings.Replace(raw, "กรุงเทพฯ", " ", 1)
+	} else if strings.Contains(raw, "กทม") {
+		res.Province = "กรุงเทพมหานคร"
+		raw = strings.Replace(raw, "กทม", " ", 1)
+	}
+
+	// 3. อำเภอ / เขต (อ. / อำเภอ / เขต)
+	reDist := regexp.MustCompile(`(?:อำเภอ|เขต|อ\.)\s*([ก-๙]+)`)
+	if match := reDist.FindStringSubmatch(raw); len(match) > 1 {
+		res.District = strings.TrimSpace(match[1])
+		raw = reDist.ReplaceAllString(raw, " ")
+	}
+
+	// 4. ตำบล / แขวง (ต. / ตำบล / แขวง)
+	reSub := regexp.MustCompile(`(?:ตำบล|แขวง|ต\.)\s*([ก-๙]+)`)
+	if match := reSub.FindStringSubmatch(raw); len(match) > 1 {
+		res.Subdistrict = strings.TrimSpace(match[1])
+		raw = reSub.ReplaceAllString(raw, " ")
+	}
+
+	// 5. ถนน (ถ. / ถนน)
+	reRoad := regexp.MustCompile(`(?:ถนน|ถ\.)\s*([ก-๙0-9/]+)`)
+	if match := reRoad.FindStringSubmatch(raw); len(match) > 1 {
+		res.Road = strings.TrimSpace(match[1])
+		raw = reRoad.ReplaceAllString(raw, " ")
+	}
+
+	// 6. ซอย / ตรอก (ซ. / ซอย / ตรอก)
+	reAlley := regexp.MustCompile(`(?:ตรอก\/ซอย|ตรอก|ซอย|ซ\.)\s*([ก-๙0-9/]+(?:\s+[0-9]+(?:\/[0-9]+)?)?)`)
+	if match := reAlley.FindStringSubmatch(raw); len(match) > 1 {
+		res.Alley = strings.TrimSpace(match[1])
+		raw = reAlley.ReplaceAllString(raw, " ")
+	}
+
+	// 7. หมู่ที่ (ม. / หมู่ / หมู่ที่)
+	reVillage := regexp.MustCompile(`(?:หมู่ที่|หมู่|ม\.)\s*([0-9]+)`)
+	if match := reVillage.FindStringSubmatch(raw); len(match) > 1 {
+		res.VillageNumber = strings.TrimSpace(match[1])
+		raw = reVillage.ReplaceAllString(raw, " ")
+	}
+
+	// 8. บ้านเลขที่ (บ้านเลขที่ / เลขที่ หรือเศษส่วนเลขที่เหลือ)
+	reHouse := regexp.MustCompile(`(?:บ้านเลขที่|เลขที่)?\s*([0-9]+(?:\/[0-9]+)?)`)
+	if match := reHouse.FindStringSubmatch(raw); len(match) > 1 && match[1] != "" {
+		res.HouseNumber = strings.TrimSpace(match[1])
+	}
+
+	return res
+}
+
+func parseThaiIDAddress(thaiIDProfile map[string]interface{}) (houseNumber, villageNumber, alley, road, subdistrict, district, province string, postalCode int) {
+	if houseAddrMap, ok := thaiIDProfile["house_address"].(map[string]interface{}); ok {
+		if rawAddr, ok := houseAddrMap["raw"].(string); ok && rawAddr != "" {
+			parts := strings.Split(rawAddr, "#")
+			if len(parts) > 0 {
+				houseNumber = strings.TrimSpace(parts[0])
+			}
+			if len(parts) > 1 {
+				villageNumber = strings.TrimSpace(parts[1])
+			}
+			if len(parts) > 2 {
+				alley = strings.TrimSpace(parts[2])
+			}
+			if len(parts) > 3 && parts[3] != "" {
+				if alley == "" {
+					alley = strings.TrimSpace(parts[3])
+				} else {
+					alley = alley + " " + strings.TrimSpace(parts[3])
+				}
+			}
+			if len(parts) > 4 {
+				road = strings.TrimSpace(parts[4])
+			}
+			if len(parts) > 5 {
+				subdistrict = strings.TrimSpace(parts[5])
+			}
+			if len(parts) > 6 {
+				district = strings.TrimSpace(parts[6])
+			}
+			if len(parts) > 7 {
+				province = strings.TrimSpace(parts[7])
+			}
+		}
+	}
+
+	var combinedStr string
+	if addrMap, ok := thaiIDProfile["address"].(map[string]interface{}); ok {
+		if formattedAddr, ok := addrMap["formatted"].(string); ok {
+			combinedStr = strings.TrimSpace(formattedAddr)
+		}
+	} else if addrStr, ok := thaiIDProfile["address"].(string); ok && addrStr != "" {
+		combinedStr = strings.TrimSpace(addrStr)
+	}
+
+	// หากไม่มีข้อมูลแบบ raw หรือข้อมูลบางตัวว่าง และมี combinedStr หรือ subdistrict มีข้อความรวมที่อยู่
+	if combinedStr != "" || strings.Contains(subdistrict, "ต.") || strings.Contains(subdistrict, "อ.") || strings.Contains(subdistrict, "จ.") || strings.Contains(subdistrict, "แขวง") || strings.Contains(subdistrict, "เขต") {
+		targetStr := combinedStr
+		if targetStr == "" {
+			targetStr = subdistrict
+		}
+		parsed := parseThaiAddressString(targetStr)
+		if houseNumber == "" {
+			houseNumber = parsed.HouseNumber
+		}
+		if villageNumber == "" {
+			villageNumber = parsed.VillageNumber
+		}
+		if alley == "" {
+			alley = parsed.Alley
+		}
+		if road == "" {
+			road = parsed.Road
+		}
+		if district == "" || strings.Contains(district, "อ.") {
+			district = parsed.District
+		}
+		if province == "" || strings.Contains(province, "จ.") {
+			province = parsed.Province
+		}
+		if postalCode == 0 {
+			postalCode = parsed.PostalCode
+		}
+		if parsed.Subdistrict != "" {
+			subdistrict = parsed.Subdistrict
+		} else if strings.Contains(subdistrict, "ต.") || strings.Contains(subdistrict, "อ.") {
+			subdistrict = ""
+		}
+	}
+
+	return
+}
+
 // encryptAES256GCM encrypts plaintext using AES-256-GCM with a random 12-byte nonce.
 // keyHex must be a 64-character hex string (32 bytes = 256-bit key).
 // Returns base64(nonce + ciphertext) for storage.
@@ -1237,7 +1738,12 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 			oauthID = claims.Sub
 		} else {
 			// Fallback: Call Facebook Graph API for Standard Access Token
-			resp, err := http.Get(fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id&access_token=%s", idToken))
+			fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id&access_token=%s", idToken)
+			fbReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fbURL, nil)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create facebook request: %w", err)
+			}
+			resp, err := oauthHTTPClient.Do(fbReq)
 			if err != nil {
 				return nil, fmt.Errorf("failed to call facebook api: %w", err)
 			}
@@ -1259,11 +1765,11 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 			oauthID = fbProfile.ID
 		}
 	} else if provider == "line" {
-		// Fetch LINE profile using idToken as access token
-		req, err := http.NewRequest(http.MethodGet, "https://api.line.me/v2/profile", nil)
+		// Fetch LINE profile using idToken as access token with resilient HTTP client
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://api.line.me/v2/profile", nil)
 		if err == nil {
 			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", idToken))
-			if resp, err := http.DefaultClient.Do(req); err == nil && resp.StatusCode == http.StatusOK {
+			if resp, err := oauthHTTPClient.Do(req); err == nil && resp.StatusCode == http.StatusOK {
 				var lineProfile struct {
 					UserID string `json:"userId"`
 				}
@@ -1280,11 +1786,11 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		oauthID = idToken
 	} else {
 		// Google Validation
-		payload, err := idtoken.Validate(context.Background(), idToken, "")
+		sub, _, _, _, _, err := verifyGoogleIDToken(idToken, u.config.GoogleClientID)
 		if err != nil {
 			return nil, errors.New("invalid google token")
 		}
-		oauthID = payload.Subject
+		oauthID = sub
 	}
 
 	// ค้นหาบัญชีชั่วคราวจาก oauthID หรือ tempUser ID (UUID)
@@ -1363,6 +1869,20 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		}
 	}
 
+	// Conflict Check: ตรวจสอบว่า existingUser เคยผูกบัญชีของ Provider นี้ด้วย ID อื่นไว้แล้วหรือไม่
+	existingProfile, _ := u.repo.GetExistingSocialProfile(existingUser.ID, provider)
+	if existingProfile != nil {
+		for _, acc := range tempUser.OauthAccounts {
+			if strings.EqualFold(acc.Provider, provider) && existingProfile.ProviderId != acc.ProviderId {
+				return nil, &domain.SocialConflictError{
+					Provider:            provider,
+					ExistingAccountName: existingProfile.DisplayName,
+					OAuthProfileID:      acc.ID.String(),
+				}
+			}
+		}
+	}
+
 	for i := range tempUser.OauthAccounts {
 		acc := tempUser.OauthAccounts[i]
 		// ลบ record เก่าที่ผูกกับ tempUser ก่อน
@@ -1395,11 +1915,29 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		if tempUser.Information.Prefix != "" {
 			existingUser.Information.Prefix = tempUser.Information.Prefix
 		}
-		if tempUser.Information.Name != "" {
-			existingUser.Information.Name = tempUser.Information.Name
+		if isPlaceholderName(existingUser.Information.Name) {
+			if tempUser.Information.Name != "" {
+				existingUser.Information.Name = tempUser.Information.Name
+			}
+			if tempUser.Information.LastName != "" {
+				existingUser.Information.LastName = tempUser.Information.LastName
+			} else if isPlaceholderLastName(existingUser.Information.LastName) {
+				existingUser.Information.LastName = ""
+			}
+		} else {
+			if tempUser.Information.Name != "" && existingUser.Information.Name == "" {
+				existingUser.Information.Name = tempUser.Information.Name
+			}
+			if tempUser.Information.LastName != "" && existingUser.Information.LastName == "" {
+				existingUser.Information.LastName = tempUser.Information.LastName
+			}
 		}
-		if tempUser.Information.LastName != "" {
-			existingUser.Information.LastName = tempUser.Information.LastName
+		if tempUser.ImageProfileUrl != nil && *tempUser.ImageProfileUrl != "" && (existingUser.ImageProfileUrl == nil || *existingUser.ImageProfileUrl == "") {
+			existingUser.ImageProfileUrl = tempUser.ImageProfileUrl
+		}
+		if tempUser.Email != nil && *tempUser.Email != "" && (existingUser.Email == nil || *existingUser.Email == "") {
+			existingUser.Email = tempUser.Email
+			existingUser.Information.Email = tempUser.Email
 		}
 		if tempUser.Information.Birthday != nil {
 			existingUser.Information.Birthday = tempUser.Information.Birthday
@@ -1473,6 +2011,70 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 	}, nil
 }
 
+func (u *authUseCase) bindOverride(req domain.BindOverrideRequest, provider string) (*domain.AuthResponse, error) {
+	user, err := u.repo.GetByPhoneNumber(req.Phone)
+	if err != nil || user == nil {
+		return nil, fmt.Errorf("user with phone number not found: %w", err)
+	}
+
+	// Verify PIN for zero-trust security
+	if user.PinHash == "" {
+		return nil, errors.New("บัญชีนี้ยังไม่ได้ตั้งค่ารหัส PIN")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PinHash), []byte(req.Pin)); err != nil {
+		return nil, errors.New("รหัส PIN ไม่ถูกต้อง")
+	}
+
+	oauthID, err := uuid.Parse(req.OAuthProfileID)
+	if err != nil {
+		return nil, errors.New("invalid oauth_profile_id format")
+	}
+
+	// Atomic transaction: detach old profile and bind new profile
+	if err := u.repo.BindOverrideSocialAccount(user.ID, provider, oauthID); err != nil {
+		return nil, fmt.Errorf("failed to override social binding: %w", err)
+	}
+
+	updatedUser, err := u.repo.GetByID(user.ID)
+	if err != nil {
+		updatedUser = user
+	}
+
+	accessToken, err := u.generateAccessToken(updatedUser)
+	if err != nil {
+		return nil, err
+	}
+
+	refreshToken, err := u.generateRefreshToken(updatedUser)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("[SECURITY AUDIT] Social account override successful: user_id=%s, provider=%s, new_oauth_id=%s", user.ID, provider, req.OAuthProfileID)
+
+	return &domain.AuthResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		User:         updatedUser,
+	}, nil
+}
+
+func (u *authUseCase) BindOverrideGoogle(req domain.BindOverrideRequest) (*domain.AuthResponse, error) {
+	return u.bindOverride(req, "google")
+}
+
+func (u *authUseCase) BindOverrideFacebook(req domain.BindOverrideRequest) (*domain.AuthResponse, error) {
+	return u.bindOverride(req, "facebook")
+}
+
+func (u *authUseCase) BindOverrideLine(req domain.BindOverrideRequest) (*domain.AuthResponse, error) {
+	return u.bindOverride(req, "line")
+}
+
+func (u *authUseCase) BindOverrideApple(req domain.BindOverrideRequest) (*domain.AuthResponse, error) {
+	return u.bindOverride(req, "apple")
+}
+
 func (u *authUseCase) CheckPhone(phoneNumber string) (bool, error) {
 	_, err := u.repo.GetByPhoneNumber(phoneNumber)
 	if err != nil {
@@ -1490,20 +2092,17 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 	formData.Set("grant_type", "authorization_code")
 	formData.Set("code", code)
 	formData.Set("redirect_uri", redirectURI)
-	formData.Set("client_id", u.config.ThaiIDClientID)
-	formData.Set("client_secret", u.config.ThaiIDClientSecret)
 
-	reqToken, err := http.NewRequest(http.MethodPost, tokenURL, strings.NewReader(formData.Encode()))
+	reqToken, err := http.NewRequestWithContext(context.Background(), http.MethodPost, tokenURL, strings.NewReader(formData.Encode()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
-	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", u.config.ThaiIDClientID, u.config.ThaiIDClientSecret)))
+	basicAuth := base64.StdEncoding.EncodeToString([]byte(u.config.ThaiIDClientID + ":" + u.config.ThaiIDClientSecret))
 	reqToken.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	reqToken.Header.Set("Authorization", fmt.Sprintf("Basic %s", basicAuth))
 	reqToken.Header.Set("x-api-key", u.config.ThaiIDApiKey)
 
-	httpClient := &http.Client{Timeout: 10 * time.Second}
-	respToken, err := httpClient.Do(reqToken)
+	respToken, err := oauthHTTPClient.Do(reqToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute token request: %w", err)
 	}
@@ -1605,10 +2204,8 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 		user.Information.VerificationStatus = "verified"
 		user.Information.VerifiedDate = &now
 
-		// Hash PID และเก็บเป็น encrypted
-		h := sha256.New()
-		h.Write([]byte(pid))
-		user.Information.IdentityNumberHash = hex.EncodeToString(h.Sum(nil))
+		// Hash PID using HMAC-SHA256 (consistent with LoginWithThaiID)
+		user.Information.IdentityNumberHash = hmacSHA256(pid, u.config.PIDHmacSecret)
 		if user.Information.IdentityNumberEncrypted == "" {
 			if encrypted, err := encryptAES256GCM(pid, u.config.PIDEncryptionKey); err == nil {
 				user.Information.IdentityNumberEncrypted = encrypted
@@ -1617,23 +2214,73 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 			}
 		}
 
-		// เติมชื่อ-นามสกุลถ้ายังว่าง
-		if givenName, ok := dopaProfile["given_name"].(string); ok && givenName != "" && user.Information.Name == "" {
+		// อัปเดตชื่อ-นามสกุลทางการจาก DOPA ThaiID
+		givenName, _ := dopaProfile["given_name"].(string)
+		familyName, _ := dopaProfile["family_name"].(string)
+		if givenName != "" {
 			user.Information.Name = givenName
 		}
-		if familyName, ok := dopaProfile["family_name"].(string); ok && familyName != "" && user.Information.LastName == "" {
+		if familyName != "" {
 			user.Information.LastName = familyName
+		} else if isPlaceholderLastName(user.Information.LastName) {
+			user.Information.LastName = ""
 		}
-		if title, ok := dopaProfile["titleTh"].(string); ok && title != "" && user.Information.Prefix == "" {
+
+		// คำนำหน้า
+		title, _ := dopaProfile["titleTh"].(string)
+		if title == "" {
+			title, _ = dopaProfile["title"].(string)
+		}
+		if title != "" {
 			user.Information.Prefix = title
 		}
-		if birthdateStr, ok := dopaProfile["birthdate"].(string); ok && birthdateStr != "" && user.Information.Birthday == nil {
+
+		// วันเกิด
+		if birthdateStr, ok := dopaProfile["birthdate"].(string); ok && birthdateStr != "" {
 			if t, err := time.Parse("2006-01-02", birthdateStr); err == nil {
 				user.Information.Birthday = &t
 			}
 		}
 
+		// วันหมดอายุบัตร
+		if expiryStr, ok := dopaProfile["date_of_expiry"].(string); ok && expiryStr != "" {
+			if t, err := time.Parse("2006-01-02", expiryStr); err == nil {
+				user.Information.IdCardExpiry = &t
+			}
+		}
+
+		idCardTypeVal := 1
+		user.Information.IdCardType = &idCardTypeVal
+
+		// ดึงที่อยู่ตามทะเบียนบ้านจาก ThaiID
+		hNo, vNo, alley, road, subdist, dist, prov, pCode := parseThaiIDAddress(dopaProfile)
+		if hNo != "" {
+			user.Information.HouseNumber = hNo
+		}
+		if vNo != "" {
+			user.Information.VillageNumber = vNo
+		}
+		if alley != "" {
+			user.Information.Alley = alley
+		}
+		if road != "" {
+			user.Information.Road = road
+		}
+		if subdist != "" {
+			user.Information.Subdistrict = subdist
+		}
+		if dist != "" {
+			user.Information.District = dist
+		}
+		if prov != "" {
+			user.Information.Province = prov
+		}
+		if pCode > 0 {
+			user.Information.PostalCode = pCode
+		}
+
 		user.Information.UpdatedDate = now
+		user.UpdatedDate = now
 		if err := u.repo.Update(user); err != nil {
 			log.Printf("⚠️  BindThaiID: failed to update user information: %v", err)
 		}
@@ -1660,3 +2307,160 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 		User:         updatedUser,
 	}, nil
 }
+
+func (u *authUseCase) GetSocialLinks(userID uuid.UUID) (*domain.SocialAccountsResponse, error) {
+	return u.repo.GetSocialLinks(userID)
+}
+
+func (u *authUseCase) UnlinkSocial(userID uuid.UUID, provider string) error {
+	return u.repo.UnlinkSocial(userID, provider)
+}
+
+func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest) error {
+	switch strings.ToLower(req.Provider) {
+	case "google":
+		googleID, email, name, picture, rawDataStr, err := verifyGoogleIDToken(req.IDToken, u.config.GoogleClientID)
+		if err != nil {
+			return errors.New("invalid google token")
+		}
+
+		account := &domain.UserOauthAccount{
+			Provider:    "Google",
+			ProviderId:  googleID,
+			Email:       email,
+			DisplayName: name,
+			AvatarUrl:   picture,
+			RawData:     rawDataStr,
+			CreatedAt:   time.Now(),
+		}
+		return u.repo.LinkSocialAccount(userID, account)
+
+	case "facebook":
+		fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", req.AccessToken)
+		fbReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fbURL, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create facebook request: %w", err)
+		}
+		resp, err := oauthHTTPClient.Do(fbReq)
+		if err != nil {
+			return fmt.Errorf("failed to call facebook api: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("invalid facebook token: %s", string(body))
+		}
+
+		var fbProfile struct {
+			ID    string `json:"id"`
+			Name  string `json:"name"`
+			Email string `json:"email"`
+			Picture struct {
+				Data struct {
+					URL string `json:"url"`
+				} `json:"data"`
+			} `json:"picture"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&fbProfile); err != nil {
+			return fmt.Errorf("failed to parse facebook response: %w", err)
+		}
+
+		rawBytes, _ := json.Marshal(fbProfile)
+		account := &domain.UserOauthAccount{
+			Provider:    "Facebook",
+			ProviderId:  fbProfile.ID,
+			Email:       fbProfile.Email,
+			DisplayName: fbProfile.Name,
+			AvatarUrl:   fbProfile.Picture.Data.URL,
+			RawData:     string(rawBytes),
+			CreatedAt:   time.Now(),
+		}
+		return u.repo.LinkSocialAccount(userID, account)
+
+	case "line":
+		lineAccessToken := req.AccessToken
+		if req.AuthCode != "" {
+			tokenData := url.Values{}
+			tokenData.Set("grant_type", "authorization_code")
+			tokenData.Set("code", req.AuthCode)
+			tokenData.Set("redirect_uri", req.RedirectURI)
+			tokenData.Set("client_id", u.config.LineChannelID)
+			tokenData.Set("client_secret", u.config.LineChannelSecret)
+
+			tokenReq, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://api.line.me/oauth2/v2.1/token", strings.NewReader(tokenData.Encode()))
+			if err == nil {
+				tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				tokenResp, err := oauthHTTPClient.Do(tokenReq)
+				if err == nil && tokenResp.StatusCode == http.StatusOK {
+					var tokenResult struct {
+						AccessToken string `json:"access_token"`
+					}
+					if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err == nil && tokenResult.AccessToken != "" {
+						lineAccessToken = tokenResult.AccessToken
+					}
+					tokenResp.Body.Close()
+				}
+			}
+		}
+
+		lineReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://api.line.me/v2/profile", nil)
+		if err != nil {
+			return fmt.Errorf("failed to create line profile request: %w", err)
+		}
+		lineReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", lineAccessToken))
+
+		profileResp, err := oauthHTTPClient.Do(lineReq)
+		if err != nil {
+			return fmt.Errorf("failed to fetch line profile: %w", err)
+		}
+		defer profileResp.Body.Close()
+
+		if profileResp.StatusCode != http.StatusOK {
+			return fmt.Errorf("failed to verify line token (status %d)", profileResp.StatusCode)
+		}
+
+		var lineProfile struct {
+			UserID      string `json:"userId"`
+			DisplayName string `json:"displayName"`
+			PictureURL  string `json:"pictureUrl"`
+		}
+		if err := json.NewDecoder(profileResp.Body).Decode(&lineProfile); err != nil {
+			return fmt.Errorf("failed to parse line profile response: %w", err)
+		}
+
+		rawBytes, _ := json.Marshal(lineProfile)
+		account := &domain.UserOauthAccount{
+			Provider:    "Line",
+			ProviderId:  lineProfile.UserID,
+			DisplayName: lineProfile.DisplayName,
+			AvatarUrl:   lineProfile.PictureURL,
+			RawData:     string(rawBytes),
+			CreatedAt:   time.Now(),
+		}
+		return u.repo.LinkSocialAccount(userID, account)
+
+	case "apple":
+		claims, err := verifyAppleIDToken(req.IDToken)
+		if err != nil {
+			return fmt.Errorf("invalid apple id token: %w", err)
+		}
+
+		account := &domain.UserOauthAccount{
+			Provider:    "Apple",
+			ProviderId:  claims.Sub,
+			Email:       claims.Email,
+			DisplayName: "Apple User",
+			CreatedAt:   time.Now(),
+		}
+		return u.repo.LinkSocialAccount(userID, account)
+
+	default:
+		return fmt.Errorf("unsupported provider: %s", req.Provider)
+	}
+}
+
+func (u *authUseCase) UpdateProfileImage(userID uuid.UUID, imageURL string) error {
+	return u.repo.UpdateProfileImage(userID, imageURL)
+}
+
