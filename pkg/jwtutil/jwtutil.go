@@ -82,3 +82,16 @@ func ExtractUserID(c fiber.Ctx) (string, error) {
 	}
 	return userID, nil
 }
+
+func ParseMobileToken(tokenString string, secret string) (*MobileClaims, error) {
+	token, err := jwt.ParseWithClaims(tokenString, &MobileClaims{}, func(t *jwt.Token) (interface{}, error) {
+		return []byte(secret), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if claims, ok := token.Claims.(*MobileClaims); ok && token.Valid {
+		return claims, nil
+	}
+	return nil, errors.New("invalid token")
+}

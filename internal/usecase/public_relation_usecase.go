@@ -2,10 +2,16 @@ package usecase
 
 import (
 	"errors"
+	"sync"
 	"super-app-chonburi-go-mobile/internal/domain"
 	"time"
 
 	"github.com/google/uuid"
+)
+
+var (
+	newsViewCache    sync.Map // key -> time.Time
+	newsViewCooldown = 30 * time.Minute
 )
 
 type publicRelationMobileUseCase struct {
@@ -27,11 +33,7 @@ func (u *publicRelationMobileUseCase) GetNewsFeed(moduleId string, page int, lim
 }
 
 func (u *publicRelationMobileUseCase) GetNewsDetail(moduleId string, id string, userId string) (*domain.PublicRelation, bool, error) {
-
-	go func() {
-		_ = u.repo.IncrementVisitorCount(id)
-	}()
-
+	// Idempotent GET - Side effects removed to prevent inflated/duplicate counts
 	pr, err := u.repo.GetByID(moduleId, id)
 	if err != nil {
 		return nil, false, err
@@ -49,6 +51,31 @@ func (u *publicRelationMobileUseCase) GetNewsDetail(moduleId string, id string, 
 	}
 
 	return pr, liked, nil
+}
+
+func (u *publicRelationMobileUseCase) RecordNewsView(prId string, userId string, sessionId string) error {
+	identifier := userId
+	if identifier == "" {
+		identifier = sessionId
+	}
+	if identifier == "" {
+		identifier = "anon"
+	}
+
+	cacheKey := prId + ":" + identifier
+	now := time.Now()
+
+	if lastTimeVal, ok := newsViewCache.Load(cacheKey); ok {
+		if lastTime, ok := lastTimeVal.(time.Time); ok {
+			if now.Sub(lastTime) < newsViewCooldown {
+				// Cooldown active, duplicate skipped (0 DB writes)
+				return nil
+			}
+		}
+	}
+
+	newsViewCache.Store(cacheKey, now)
+	return u.repo.IncrementVisitorCount(prId)
 }
 
 func (u *publicRelationMobileUseCase) ToggleLike(prId string, userId string) (bool, error) {

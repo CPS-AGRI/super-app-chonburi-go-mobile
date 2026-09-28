@@ -55,6 +55,7 @@ type NotificationResponseItem struct {
 	Type        string `json:"type"`
 	Read        bool   `json:"read"`
 	ReferenceID string `json:"reference_id,omitempty"`
+	Source      string `json:"source,omitempty"`
 }
 
 type NotificationRepository interface {

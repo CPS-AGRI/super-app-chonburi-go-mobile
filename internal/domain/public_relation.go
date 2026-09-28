@@ -144,4 +144,5 @@ type PublicRelationMobileUseCase interface {
 	ReportComment(commentId string) error
 	HideComment(commentId string) error
 	GetWelcomeScreen() (*MunicipalityWelcomeScreen, error)
+	RecordNewsView(prId string, userId string, sessionId string) error
 }

@@ -30,13 +30,19 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 		ModuleName     string
 		Read           bool
 		ReferenceID    string
+		IsPR           bool
+		IsComplaint    bool
 	}
 	var txItems []txRow
 	err := r.db.Raw(`
 		SELECT n.id, n.reference_title, n.reference_body, n.created_date, n.updated_date, COALESCE(m.name_th, '') as module_name,
-		       (un.module_notification_id IS NOT NULL) as read, n.reference_id
+		       (un.module_notification_id IS NOT NULL) as read, n.reference_id,
+		       (pr.id IS NOT NULL) as is_pr,
+		       (mc.id IS NOT NULL) as is_complaint
 		FROM module_notifications n
 		LEFT JOIN modules m ON m.id = n.module_id
+		LEFT JOIN module_public_relations pr ON pr.id::text = n.reference_id
+		LEFT JOIN module_complaints mc ON mc.id::text = n.reference_id
 		LEFT JOIN module_user_notifications un ON un.module_notification_id = n.id AND un.user_id = ?
 		WHERE (n.user_id = ? OR (n.user_id IS NULL AND n.type = 'user'))
 	`, userID, userID).Scan(&txItems).Error
@@ -70,15 +76,27 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 	var results []domain.NotificationResponseItem
 
 	for _, item := range txItems {
-
 		notifType := "general"
 		nameLower := strings.ToLower(item.ModuleName)
-		if strings.Contains(nameLower, "ร้องทุกข์") || strings.Contains(nameLower, "complaint") {
+		titleLower := strings.ToLower(item.ReferenceTitle)
+		bodyLower := strings.ToLower(item.ReferenceBody)
+
+		// 1. News / Public Relations: check IsPR flag first, or keywords mentioning news / PR
+		if item.IsPR || strings.Contains(nameLower, "ประชาสัมพันธ์") || strings.Contains(nameLower, "public") || strings.Contains(titleLower, "ข่าว") || strings.Contains(bodyLower, "ข่าว") {
+			notifType = "news"
+		// 2. Complaint: check IsComplaint or module name/keywords
+		} else if item.IsComplaint || strings.Contains(nameLower, "ร้องทุกข์") || strings.Contains(nameLower, "ร้องเรียน") || strings.Contains(nameLower, "complaint") {
 			notifType = "complaint"
 		} else if strings.Contains(nameLower, "ภาษี") || strings.Contains(nameLower, "tax") {
 			notifType = "tax"
 		} else if strings.Contains(nameLower, "น้ำท่วม") || strings.Contains(nameLower, "flood") || strings.Contains(nameLower, "ภัย") {
 			notifType = "flood"
+		} else if strings.Contains(nameLower, "กล้อง") || strings.Contains(nameLower, "cctv") {
+			notifType = "cctv"
+		} else if strings.Contains(nameLower, "สภาพอากาศ") || strings.Contains(nameLower, "weather") {
+			notifType = "weather"
+		} else if strings.Contains(nameLower, "ยืนยัน") || strings.Contains(nameLower, "register") || strings.Contains(nameLower, "verify") {
+			notifType = "register"
 		}
 
 		results = append(results, domain.NotificationResponseItem{
@@ -90,6 +108,7 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 			Type:        notifType,
 			Read:        item.Read,
 			ReferenceID: item.ReferenceID,
+			Source:      "general",
 		})
 	}
 
@@ -107,6 +126,7 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 			Type:        "news",
 			Read:        item.Read,
 			ReferenceID: refID,
+			Source:      "pao",
 		})
 	}
 

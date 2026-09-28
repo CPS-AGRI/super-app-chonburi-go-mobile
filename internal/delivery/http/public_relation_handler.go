@@ -22,6 +22,7 @@ func NewPublicRelationMobileHandler(app *fiber.App, uc domain.PublicRelationMobi
 	group.Get("/modules/:moduleId/news/:id", handler.GetNewsDetail)
 
 	group.Post("/news/:id/like", handler.ToggleLike)
+	group.Post("/news/:id/view", handler.RecordNewsView)
 	group.Post("/news/:id/comments", handler.AddComment)
 	group.Get("/news/:id/comments", handler.GetComments)
 	group.Delete("/comments/:commentId", handler.DeleteComment)
@@ -88,6 +89,21 @@ func (h *publicRelationMobileHandler) ToggleLike(c fiber.Ctx) error {
 		"success": true,
 		"liked":   liked,
 	})
+}
+
+func (h *publicRelationMobileHandler) RecordNewsView(c fiber.Ctx) error {
+	id := c.Params("id")
+	var req struct {
+		UserID    string `json:"user_id"`
+		SessionID string `json:"session_id"`
+	}
+	_ = c.Bind().JSON(&req)
+
+	if err := h.uc.RecordNewsView(id, req.UserID, req.SessionID); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(fiber.Map{"success": true})
 }
 
 func (h *publicRelationMobileHandler) AddComment(c fiber.Ctx) error {

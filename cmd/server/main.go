@@ -10,7 +10,6 @@ import (
 	"super-app-chonburi-go-mobile/internal/repository"
 	"super-app-chonburi-go-mobile/internal/usecase"
 	"super-app-chonburi-go-mobile/pkg/database"
-	"super-app-chonburi-go-mobile/pkg/mail"
 	"super-app-chonburi-go-mobile/pkg/storage"
 	minioStorage "super-app-chonburi-go-mobile/pkg/storage/minio"
 
@@ -69,10 +68,7 @@ func main() {
 	moduleUseCase := usecase.NewModuleUseCase(moduleRepo)
 	http.NewModuleHandler(app, moduleUseCase)
 
-	mailSender := mail.NewSMTPEmailSender(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPEmail, cfg.SMTPPassword)
-	taxNewMobileRepo := repository.NewTaxNewMobileRepository(database.DB)
-	taxNewMobileUseCase := usecase.NewTaxNewMobileUseCase(taxNewMobileRepo, mailSender, cfg.TaxBillerID)
-	http.NewTaxNewMobileHandler(app, taxNewMobileUseCase, uploadStorage)
+	http.NewUploadHandler(app, uploadStorage)
 
 	muniBankRepo := repository.NewMunicipalityBankRepository(database.DB)
 	muniBankUseCase := usecase.NewMunicipalityBankUseCase(muniBankRepo)
@@ -93,6 +89,10 @@ func main() {
 	cctvRepo := repository.NewCCTVRepository(database.DB)
 	cctvUseCase := usecase.NewCCTVUseCase(cctvRepo)
 	http.NewCCTVHandler(app, cctvUseCase, cfg)
+
+	analyticsRepo := repository.NewAnalyticsRepository(database.DB)
+	analyticsUseCase := usecase.NewAnalyticsUseCase(analyticsRepo)
+	http.NewAnalyticsHandler(app, analyticsUseCase, cfg)
 
 	http.NewDocumentHandler(app)
 
