@@ -20,10 +20,9 @@ func NewPublicRelationMobileRepository(db *gorm.DB) domain.PublicRelationMobileR
 func (r *publicRelationMobileRepository) GetPaginated(moduleId string, page int, limit int, userId string) ([]domain.PublicRelation, error) {
 	var prs []domain.PublicRelation
 	offset := (page - 1) * limit
-	now := time.Now()
 
 	err := r.db.Preload("Images").
-		Where("module_id = ? AND status = ? AND start_date <= ? AND end_date >= ?", moduleId, "Published", now, now).
+		Where("module_id = ? AND status = ? AND start_date::date <= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date AND end_date::date >= (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Bangkok')::date", moduleId, "Published").
 		Offset(offset).
 		Limit(limit).
 		Order("created_date DESC").

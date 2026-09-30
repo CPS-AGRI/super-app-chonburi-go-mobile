@@ -80,6 +80,20 @@ func (u *complaintUseCase) UpdateComplaint(complaint *domain.Complaint, imageURL
 		return fmt.Errorf("complaint not found or unauthorized")
 	}
 
+	if existing.IsDisputed {
+		return fmt.Errorf("เรื่องร้องเรียนนี้มีการดำเนินการและตีกลับแก้ไขแล้ว ไม่สามารถแก้ไขได้")
+	}
+
+	for _, act := range existing.Activities {
+		if act.Status == domain.ComplaintStatusInProgress || act.Status == domain.ComplaintStatusCompleted || act.Status == domain.ActivityStatusDisputeRequest {
+			return fmt.Errorf("เรื่องร้องเรียนนี้มีประวัติการดำเนินการแล้ว ไม่สามารถแก้ไขได้")
+		}
+	}
+
+	if existing.Status != domain.ComplaintStatusDraft && existing.Status != domain.ComplaintStatusPending {
+		return fmt.Errorf("สามารถแก้ไขได้เฉพาะเรื่องร้องเรียนที่อยู่ในสถานะแบบร่าง หรือรอดำเนินการเท่านั้น")
+	}
+
 	existing.Description = complaint.Description
 	existing.ModuleTypeId = complaint.ModuleTypeId
 	existing.Latitude = complaint.Latitude
@@ -146,9 +160,19 @@ func (u *complaintUseCase) GetDetail(id string, userID string) (*domain.Complain
 
 func (u *complaintUseCase) DeleteComplaint(id string, userID string) error {
 
-	_, err := u.repo.GetByID(id, userID)
+	existing, err := u.repo.GetByID(id, userID)
 	if err != nil {
 		return fmt.Errorf("complaint not found or unauthorized")
+	}
+
+	if existing.IsDisputed {
+		return fmt.Errorf("เรื่องร้องเรียนนี้มีการดำเนินการและตีกลับแก้ไขแล้ว ไม่สามารถยกเลิกหรือลบได้")
+	}
+
+	for _, act := range existing.Activities {
+		if act.Status == domain.ComplaintStatusInProgress || act.Status == domain.ComplaintStatusCompleted || act.Status == domain.ActivityStatusDisputeRequest {
+			return fmt.Errorf("เรื่องร้องเรียนนี้มีประวัติการดำเนินการแล้ว ไม่สามารถยกเลิกหรือลบได้")
+		}
 	}
 
 	return u.repo.Delete(id)

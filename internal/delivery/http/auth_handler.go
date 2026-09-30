@@ -150,7 +150,7 @@ func (h *AuthHandler) ThaiIDCallback(c fiber.Ctx) error {
 		return c.Status(400).SendString("Authorization code is missing")
 	}
 
-	redirectURL := fmt.Sprintf("chonburiplus://thaiid?code=%s&state=%s", code, state)
+	redirectURL := fmt.Sprintf("chonburiconnext://thaiid?code=%s&state=%s", code, state)
 	return c.Redirect().Status(fiber.StatusFound).To(redirectURL)
 }
 
@@ -397,7 +397,10 @@ func (h *AuthHandler) GetSocialLinks(c fiber.Ctx) error {
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
-	return c.JSON(resp)
+	return c.JSON(fiber.Map{
+		"success": true,
+		"data":    resp,
+	})
 }
 
 func (h *AuthHandler) UnlinkSocial(c fiber.Ctx) error {

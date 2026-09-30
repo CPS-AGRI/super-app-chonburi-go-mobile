@@ -29,7 +29,7 @@ func (r *authRepository) GetByID(id uuid.UUID) (*domain.AppUser, error) {
 
 func (r *authRepository) GetByProviderID(provider, providerID string) (*domain.AppUser, error) {
 	var oauthAcc domain.UserOauthAccount
-	err := r.db.Where("provider = ? AND provider_id = ?", provider, providerID).First(&oauthAcc).Error
+	err := r.db.Where("LOWER(provider) = LOWER(?) AND provider_id = ?", provider, providerID).First(&oauthAcc).Error
 	if err != nil {
 		return nil, err
 	}

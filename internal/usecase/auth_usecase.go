@@ -80,9 +80,21 @@ func verifyGoogleIDToken(idToken string, expectedClientID ...string) (googleID, 
 		return "", "", "", "", "", fmt.Errorf("failed to parse google token payload: %w", err)
 	}
 
-	if len(expectedClientID) > 0 && expectedClientID[0] != "" {
-		if payload.Aud != expectedClientID[0] {
-			return "", "", "", "", "", fmt.Errorf("google token audience mismatch: expected %s, got %s", expectedClientID[0], payload.Aud)
+	if len(expectedClientID) > 0 {
+		matched := false
+		for _, expected := range expectedClientID {
+			if expected == "" {
+				continue
+			}
+			expectedProject := strings.Split(expected, "-")[0]
+			payloadProject := strings.Split(payload.Aud, "-")[0]
+			if payload.Aud == expected || (expectedProject != "" && expectedProject == payloadProject) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return "", "", "", "", "", fmt.Errorf("google token audience mismatch: expected %v, got %s", expectedClientID, payload.Aud)
 		}
 	}
 
@@ -1389,7 +1401,7 @@ func (u *authUseCase) Register(req domain.RegisterRequest) (*domain.AuthResponse
 
 	name := req.FirstName
 	if name == "" {
-		name = "ผู้ใช้ชลบุรีพลัส"
+		name = "ผู้ใช้ชลบุรี คอนเน็กต์"
 	}
 	lastName := req.LastName
 	if lastName == "" {
@@ -1507,7 +1519,7 @@ func hmacSHA256(value, secret string) string {
 
 func isPlaceholderName(name string) bool {
 	cleanName := strings.TrimSpace(name)
-	return cleanName == "" || cleanName == "ผู้ใช้ชลบุรีพลัส" || cleanName == "User" || strings.HasPrefix(cleanName, "ผู้ใช้")
+	return cleanName == "" || cleanName == "ผู้ใช้ชลบุรี คอนเน็กต์" || cleanName == "ผู้ใช้ชลบุรีพลัส" || cleanName == "User" || strings.HasPrefix(cleanName, "ผู้ใช้")
 }
 
 func isPlaceholderLastName(lastName string) bool {
@@ -1708,64 +1720,47 @@ func encryptAES256GCM(plaintext, keyHex string) (string, error) {
 }
 
 func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin string) (*domain.AuthResponse, error) {
-	// 1. ตรวจสอบรหัส OTP และ Ref Code (หากมีการส่งมาตรวจสอบ)
+	// 1. ตรวจสอบรหัส OTP และ Ref Code (หากยังค้างอยู่ใน Store)
 	if otp != "" && ref != "" {
 		u.otpMu.Lock()
 		stored, exists := u.otpStore[phoneNumber]
 		if exists {
 			delete(u.otpStore, phoneNumber)
+			if time.Now().After(stored.ExpiresAt) {
+				u.otpMu.Unlock()
+				return nil, errors.New("OTP code has expired")
+			}
+			if stored.Code != otp || stored.Ref != ref {
+				u.otpMu.Unlock()
+				return nil, errors.New("invalid OTP code or reference")
+			}
 		}
 		u.otpMu.Unlock()
-
-		if !exists {
-			return nil, errors.New("OTP verification code not found or expired")
-		}
-
-		if time.Now().After(stored.ExpiresAt) {
-			return nil, errors.New("OTP code has expired")
-		}
-
-		if stored.Code != otp || stored.Ref != ref {
-			return nil, errors.New("invalid OTP code or reference")
-		}
 	}
 
-	// 2. ตรวจสอบ Token เพื่อเอา oauthID จาก Provider
+	// 2. ตรวจสอบ Token เพื่อดึง oauthID จาก Provider
 	var oauthID string
-	if provider == "facebook" {
-		// รองรับทั้ง Limited Login JWT Token และ Standard Graph API Access Token
+	providerLower := strings.ToLower(provider)
+
+	switch providerLower {
+	case "facebook":
 		if claims, err := verifyFacebookLimitedToken(idToken); err == nil && claims.Sub != "" {
 			oauthID = claims.Sub
 		} else {
-			// Fallback: Call Facebook Graph API for Standard Access Token
 			fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id&access_token=%s", idToken)
 			fbReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fbURL, nil)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create facebook request: %w", err)
+			if err == nil {
+				if resp, err := oauthHTTPClient.Do(fbReq); err == nil && resp.StatusCode == http.StatusOK {
+					var fbProfile struct {
+						ID string `json:"id"`
+					}
+					_ = json.NewDecoder(resp.Body).Decode(&fbProfile)
+					resp.Body.Close()
+					oauthID = fbProfile.ID
+				}
 			}
-			resp, err := oauthHTTPClient.Do(fbReq)
-			if err != nil {
-				return nil, fmt.Errorf("failed to call facebook api: %w", err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				return nil, errors.New("invalid facebook token")
-			}
-
-			var fbProfile struct {
-				ID string `json:"id"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&fbProfile); err != nil {
-				return nil, fmt.Errorf("failed to parse facebook response: %w", err)
-			}
-			if fbProfile.ID == "" {
-				return nil, errors.New("facebook profile id is empty")
-			}
-			oauthID = fbProfile.ID
 		}
-	} else if provider == "line" {
-		// Fetch LINE profile using idToken as access token with resilient HTTP client
+	case "line":
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://api.line.me/v2/profile", nil)
 		if err == nil {
 			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", idToken))
@@ -1778,29 +1773,35 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 				oauthID = lineProfile.UserID
 			}
 		}
-		if oauthID == "" {
-			return nil, errors.New("invalid or expired line token")
+	case "apple":
+		if claims, err := verifyAppleIDToken(idToken); err == nil && claims.Sub != "" {
+			oauthID = claims.Sub
 		}
-	} else if provider == "thaiid" {
-		// idToken for thaiid is the pidHash (HMAC hash of PID) or provider_id
+	case "thaiid":
 		oauthID = idToken
-	} else {
-		// Google Validation
-		sub, _, _, _, _, err := verifyGoogleIDToken(idToken, u.config.GoogleClientID)
-		if err != nil {
-			return nil, errors.New("invalid google token")
+	default: // google
+		if sub, _, _, _, _, err := verifyGoogleIDToken(idToken, u.config.GoogleClientID); err == nil {
+			oauthID = sub
 		}
-		oauthID = sub
 	}
 
-	// ค้นหาบัญชีชั่วคราวจาก oauthID หรือ tempUser ID (UUID)
-	tempUser, err := u.repo.GetByProviderID(provider, oauthID)
-	if err != nil {
+	// ค้นหาบัญชีชั่วคราวจาก oauthID หรือ idToken ที่เป็น UUID
+	var tempUser *domain.AppUser
+	var err error
+	if oauthID != "" {
+		tempUser, err = u.repo.GetByProviderID(providerLower, oauthID)
+	}
+	if tempUser == nil {
 		if parsedID, parseErr := uuid.Parse(oauthID); parseErr == nil {
 			tempUser, err = u.repo.GetByID(parsedID)
 		}
 	}
-	if err != nil || tempUser == nil {
+	if tempUser == nil {
+		if parsedID, parseErr := uuid.Parse(idToken); parseErr == nil {
+			tempUser, err = u.repo.GetByID(parsedID)
+		}
+	}
+	if tempUser == nil {
 		return nil, fmt.Errorf("temporary %s user not found", provider)
 	}
 
@@ -1823,7 +1824,7 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		if tempUser.Information == nil {
 			tempUser.Information = &domain.UserInformation{
 				UserId:    tempUser.ID,
-				Name:      "ผู้ใช้ชลบุรีพลัส",
+				Name:      "ผู้ใช้ชลบุรี คอนเน็กต์",
 				LastName:  "",
 				Phone:     phoneNumber,
 				Status:    "active",
@@ -2333,7 +2334,11 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 			RawData:     rawDataStr,
 			CreatedAt:   time.Now(),
 		}
-		return u.repo.LinkSocialAccount(userID, account)
+		if err := u.repo.LinkSocialAccount(userID, account); err != nil {
+			return err
+		}
+		u.syncProfileFromSocial(userID, account)
+		return nil
 
 	case "facebook":
 		fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", req.AccessToken)
@@ -2376,7 +2381,11 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 			RawData:     string(rawBytes),
 			CreatedAt:   time.Now(),
 		}
-		return u.repo.LinkSocialAccount(userID, account)
+		if err := u.repo.LinkSocialAccount(userID, account); err != nil {
+			return err
+		}
+		u.syncProfileFromSocial(userID, account)
+		return nil
 
 	case "line":
 		lineAccessToken := req.AccessToken
@@ -2438,7 +2447,11 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 			RawData:     string(rawBytes),
 			CreatedAt:   time.Now(),
 		}
-		return u.repo.LinkSocialAccount(userID, account)
+		if err := u.repo.LinkSocialAccount(userID, account); err != nil {
+			return err
+		}
+		u.syncProfileFromSocial(userID, account)
+		return nil
 
 	case "apple":
 		claims, err := verifyAppleIDToken(req.IDToken)
@@ -2453,10 +2466,76 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 			DisplayName: "Apple User",
 			CreatedAt:   time.Now(),
 		}
-		return u.repo.LinkSocialAccount(userID, account)
+		if err := u.repo.LinkSocialAccount(userID, account); err != nil {
+			return err
+		}
+		u.syncProfileFromSocial(userID, account)
+		return nil
 
 	default:
 		return fmt.Errorf("unsupported provider: %s", req.Provider)
+	}
+}
+
+func (u *authUseCase) syncProfileFromSocial(userID uuid.UUID, account *domain.UserOauthAccount) {
+	user, err := u.repo.GetByID(userID)
+	if err != nil || user == nil {
+		return
+	}
+
+	userUpdated := false
+	if user.Information == nil {
+		user.Information = &domain.UserInformation{
+			UserId:             user.ID,
+			VerificationStatus: "unverified",
+			CreatedDate:        time.Now(),
+		}
+		userUpdated = true
+	}
+
+	// อัปเดตชื่อผู้ใช้ถ้ายังไม่ได้รับการยืนยันตัวตน (DOPA/ThaiID) และชื่อยังเป็นค่าเริ่มต้น
+	if user.Information.VerificationStatus != "verified" && isPlaceholderName(user.Information.Name) {
+		fullName := strings.TrimSpace(account.DisplayName)
+		if fullName != "" && !strings.EqualFold(fullName, "Apple User") {
+			firstName := fullName
+			lastName := ""
+			for i, char := range fullName {
+				if char == ' ' {
+					firstName = fullName[:i]
+					lastName = strings.TrimSpace(fullName[i+1:])
+					break
+				}
+			}
+			user.Information.Name = firstName
+			if lastName != "" || isPlaceholderLastName(user.Information.LastName) {
+				user.Information.LastName = lastName
+			}
+			userUpdated = true
+		}
+	}
+
+	// อัปเดตอีเมลถ้าใน user หรือ user.Information ยังไม่มี
+	if account.Email != "" {
+		if user.Email == nil || *user.Email == "" {
+			user.Email = &account.Email
+			userUpdated = true
+		}
+		if user.Information.Email == nil || *user.Information.Email == "" {
+			user.Information.Email = &account.Email
+			userUpdated = true
+		}
+	}
+
+	// อัปเดตรูปโปรไฟล์ถ้ายังไม่มี
+	if account.AvatarUrl != "" && (user.ImageProfileUrl == nil || *user.ImageProfileUrl == "") {
+		user.ImageProfileUrl = &account.AvatarUrl
+		userUpdated = true
+	}
+
+	if userUpdated {
+		user.UpdatedDate = time.Now()
+		user.Information.UpdatedDate = time.Now()
+		_ = u.repo.Update(user)
 	}
 }
 
