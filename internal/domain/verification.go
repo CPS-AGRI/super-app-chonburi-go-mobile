@@ -93,6 +93,10 @@ type UpdateAddressRequest struct {
 	PostalCode    int    `json:"postal_code"`
 }
 
+type UnregisterFCMTokenRequest struct {
+	DeviceID string `json:"device_id" validate:"required"`
+}
+
 type VerificationRepository interface {
 	GetUserWithInfo(userID uuid.UUID) (*AppUser, error)
 	GetModulesForMenu() ([]Module, error)
@@ -100,6 +104,7 @@ type VerificationRepository interface {
 	UpdateAddress(userID uuid.UUID, req *UpdateAddressRequest) error
 	GetVerificationStatus(userID uuid.UUID) (*VerificationStatusResponse, error)
 	RegisterFCMToken(userID uuid.UUID, req *RegisterFCMTokenRequest) error
+	UnregisterFCMToken(userID uuid.UUID, deviceID string) error
 	GetFCMTokensByUserID(userID uuid.UUID) ([]string, error)
 }
 
@@ -109,4 +114,5 @@ type VerificationUseCase interface {
 	UpdateAddress(userID uuid.UUID, req *UpdateAddressRequest) error
 	GetVerificationStatus(userID uuid.UUID) (*VerificationStatusResponse, error)
 	RegisterFCMToken(userID uuid.UUID, req *RegisterFCMTokenRequest) error
+	UnregisterFCMToken(userID uuid.UUID, deviceID string) error
 }

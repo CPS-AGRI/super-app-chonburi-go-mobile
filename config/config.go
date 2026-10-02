@@ -49,6 +49,11 @@ type Config struct {
 	RedisAddr     string // host:port — ใช้ field นี้กับ RedisClient
 	RedisPassword string
 	RedisDB       int
+
+	// Fahfon Microservice (10.1.2.25)
+	FahfonWeatherBaseURL string
+	FahfonWeatherMapURL  string
+	FahfonServiceKey     string
 }
 
 type MinIOConfig struct {
@@ -188,6 +193,27 @@ func LoadConfig() *Config {
 		RedisDB: func() int {
 			db, _ := strconv.Atoi(os.Getenv("REDIS_DB"))
 			return db
+		}(),
+		FahfonWeatherBaseURL: func() string {
+			u := os.Getenv("FAHFON_WEATHER_API_URL")
+			if u == "" {
+				u = "http://10.1.2.25:50059"
+			}
+			return u
+		}(),
+		FahfonWeatherMapURL: func() string {
+			u := os.Getenv("FAHFON_WEATHER_MAP_URL")
+			if u == "" {
+				u = "http://10.1.2.25:3000"
+			}
+			return u
+		}(),
+		FahfonServiceKey: func() string {
+			k := os.Getenv("FAHFON_SERVICE_KEY")
+			if k == "" {
+				k = "ff_sec_service_key_Prod_7821_wQ9s8Zx2tA"
+			}
+			return k
 		}(),
 	}
 }

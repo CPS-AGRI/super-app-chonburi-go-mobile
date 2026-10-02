@@ -9,7 +9,6 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 type verificationRepository struct {
@@ -170,18 +169,53 @@ func (r *verificationRepository) GetVerificationStatus(userID uuid.UUID) (*domai
 	}, nil
 }
 
+const MaxDevicesPerUser = 3
+
 func (r *verificationRepository) RegisterFCMToken(userID uuid.UUID, req *domain.RegisterFCMTokenRequest) error {
-	token := domain.UserFCMToken{
+	now := time.Now()
+
+	// 1. ตรวจสอบว่า device_id นี้ของ user_id นี้มีอยู่แล้วหรือไม่
+	var existing domain.UserFCMToken
+	err := r.db.Where("user_id = ? AND device_id = ?", userID, req.DeviceID).First(&existing).Error
+	if err == nil {
+		// เครื่องเดิม -> อัปเดต Token และ updated_date (เป็น Active ล่าสุด)
+		return r.db.Model(&domain.UserFCMToken{}).
+			Where("user_id = ? AND device_id = ?", userID, req.DeviceID).
+			Updates(map[string]interface{}{
+				"token":        req.Token,
+				"updated_date": now,
+			}).Error
+	}
+
+	// 2. ถ้าเป็นเครื่องใหม่ -> ตรวจสอบจำนวนเครื่องปัจจุบันของ User คนนี้
+	var totalDevices int64
+	r.db.Model(&domain.UserFCMToken{}).Where("user_id = ?", userID).Count(&totalDevices)
+
+	// หากครบหรือเกินเพดาน MaxDevicesPerUser (3 เครื่อง) -> ดำเนินการ LRU Eviction: ลบเครื่องที่ updated_date เก่าที่สุดออก 1 เครื่อง
+	if totalDevices >= MaxDevicesPerUser {
+		var oldestDevice domain.UserFCMToken
+		if err := r.db.Where("user_id = ?", userID).
+			Order("updated_date ASC, created_date ASC").
+			First(&oldestDevice).Error; err == nil {
+			_ = r.db.Where("user_id = ? AND device_id = ?", userID, oldestDevice.DeviceID).
+				Delete(&domain.UserFCMToken{}).Error
+		}
+	}
+
+	// 3. บันทึกเครื่องใหม่เข้าไป
+	newToken := domain.UserFCMToken{
 		UserID:      userID,
 		DeviceID:    req.DeviceID,
 		Token:       req.Token,
-		CreatedDate: time.Now(),
-		UpdatedDate: time.Now(),
+		CreatedDate: now,
+		UpdatedDate: now,
 	}
-	return r.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "user_id"}, {Name: "device_id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"token", "updated_date"}),
-	}).Create(&token).Error
+	return r.db.Create(&newToken).Error
+}
+
+func (r *verificationRepository) UnregisterFCMToken(userID uuid.UUID, deviceID string) error {
+	return r.db.Where("user_id = ? AND device_id = ?", userID, deviceID).
+		Delete(&domain.UserFCMToken{}).Error
 }
 
 func (r *verificationRepository) GetFCMTokensByUserID(userID uuid.UUID) ([]string, error) {

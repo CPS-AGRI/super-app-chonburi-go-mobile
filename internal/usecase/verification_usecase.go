@@ -196,3 +196,10 @@ func (u *verificationUseCase) UpdateAddress(userID uuid.UUID, req *domain.Update
 func (u *verificationUseCase) RegisterFCMToken(userID uuid.UUID, req *domain.RegisterFCMTokenRequest) error {
 	return u.repo.RegisterFCMToken(userID, req)
 }
+
+func (u *verificationUseCase) UnregisterFCMToken(userID uuid.UUID, deviceID string) error {
+	if deviceID == "" {
+		return errors.New("device_id is required")
+	}
+	return u.repo.UnregisterFCMToken(userID, deviceID)
+}

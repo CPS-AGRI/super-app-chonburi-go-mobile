@@ -94,6 +94,10 @@ func main() {
 	analyticsUseCase := usecase.NewAnalyticsUseCase(analyticsRepo)
 	http.NewAnalyticsHandler(app, analyticsUseCase, cfg)
 
+	weatherRepo := repository.NewWeatherRepository(database.DB, cfg, redisClient)
+	weatherUseCase := usecase.NewWeatherUseCase(weatherRepo)
+	http.NewWeatherHandler(app, weatherUseCase)
+
 	http.NewDocumentHandler(app)
 
 	app.Get("/", func(c fiber.Ctx) error {
