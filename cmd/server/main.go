@@ -98,6 +98,10 @@ func main() {
 	weatherUseCase := usecase.NewWeatherUseCase(weatherRepo)
 	http.NewWeatherHandler(app, weatherUseCase)
 
+	waterLevelRepo := repository.NewWaterLevelRepository(database.DB, cfg, redisClient)
+	waterLevelUseCase := usecase.NewWaterLevelUseCase(waterLevelRepo)
+	http.NewWaterLevelHandler(app, waterLevelUseCase)
+
 	http.NewDocumentHandler(app)
 
 	app.Get("/", func(c fiber.Ctx) error {

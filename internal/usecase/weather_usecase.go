@@ -13,6 +13,10 @@ type WeatherUseCase interface {
 	GetStationForecast(ctx context.Context, imei string) (map[string]interface{}, error)
 	GetStationGraph(ctx context.Context, imei, variable string, timeframe int, date string) (map[string]interface{}, error)
 	GetMapFrames(ctx context.Context, variable, animType, date string) (map[string]interface{}, error)
+	GetMapTiles(ctx context.Context, variable, animType string) (map[string]interface{}, error)
+	GetMapTilesRange(ctx context.Context, variable, animType, date string, minRow, maxRow, minCol, maxCol int) (map[string]interface{}, error)
+	GetStationMonthlyStats(ctx context.Context, imei string, month, year int) (map[string]interface{}, error)
+	GetSubdistrictForecast(ctx context.Context, district, subdistrict, province string) (map[string]interface{}, error)
 	FlushCache(ctx context.Context) error
 }
 
@@ -56,6 +60,37 @@ func (u *weatherUseCase) GetMapFrames(ctx context.Context, variable, animType, d
 		animType = "nrt"
 	}
 	return u.repo.GetMapFrames(ctx, variable, animType, date)
+}
+
+func (u *weatherUseCase) GetMapTiles(ctx context.Context, variable, animType string) (map[string]interface{}, error) {
+	if variable == "" {
+		variable = "nrtrr"
+	}
+	if animType == "" {
+		animType = "nrt"
+	}
+	return u.repo.GetMapTiles(ctx, variable, animType)
+}
+
+func (u *weatherUseCase) GetMapTilesRange(ctx context.Context, variable, animType, date string, minRow, maxRow, minCol, maxCol int) (map[string]interface{}, error) {
+	if variable == "" {
+		variable = "nrtrr"
+	}
+	if animType == "" {
+		animType = "nrt"
+	}
+	return u.repo.GetMapTilesRange(ctx, variable, animType, date, minRow, maxRow, minCol, maxCol)
+}
+
+func (u *weatherUseCase) GetStationMonthlyStats(ctx context.Context, imei string, month, year int) (map[string]interface{}, error) {
+	return u.repo.GetStationMonthlyStats(ctx, imei, month, year)
+}
+
+func (u *weatherUseCase) GetSubdistrictForecast(ctx context.Context, district, subdistrict, province string) (map[string]interface{}, error) {
+	if province == "" {
+		province = "ชลบุรี"
+	}
+	return u.repo.GetSubdistrictForecast(ctx, district, subdistrict, province)
 }
 
 func (u *weatherUseCase) FlushCache(ctx context.Context) error {

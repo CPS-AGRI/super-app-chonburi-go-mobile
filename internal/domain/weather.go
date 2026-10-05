@@ -26,6 +26,8 @@ func (WeatherAccount) TableName() string {
 
 type FahfonStationItem struct {
 	IMEI         string             `json:"imei"`
+	StationName  string             `json:"stationName"`
+	Serial       string             `json:"serial"`
 	IsOwner      bool               `json:"isOwner"`
 	Parameters   FahfonParameters   `json:"parameters"`
 	Position     FahfonPosition     `json:"position"`
@@ -63,6 +65,8 @@ type FahfonPosition struct {
 
 type FahfonRegistedIMEI struct {
 	AccountID      string `json:"accountId"`
+	StationName    string `json:"stationName"`
+	Serial         string `json:"serial"`
 	CommonSiteName string `json:"commonSiteName"`
 	Email          string `json:"email"`
 	Latitude       string `json:"latitude"`
@@ -81,6 +85,9 @@ type FahfonStationsResponse struct {
 type WeatherStationDTO struct {
 	ID              string  `json:"id"`
 	IMEI            string  `json:"imei"`
+	Serial          string  `json:"serial"`
+	DeviceName      string  `json:"deviceName"`
+	StationName     string  `json:"stationName"`
 	Name            string  `json:"name"`
 	LocationName    string  `json:"locationName"`
 	AccountID       string  `json:"accountId"`

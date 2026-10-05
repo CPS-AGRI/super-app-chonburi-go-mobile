@@ -54,6 +54,10 @@ type Config struct {
 	FahfonWeatherBaseURL string
 	FahfonWeatherMapURL  string
 	FahfonServiceKey     string
+
+	// Fahfon River Microservice (10.1.2.19)
+	RiverServiceURL string
+	RiverGo2RTCURL  string
 }
 
 type MinIOConfig struct {
@@ -214,6 +218,20 @@ func LoadConfig() *Config {
 				k = "ff_sec_service_key_Prod_7821_wQ9s8Zx2tA"
 			}
 			return k
+		}(),
+		RiverServiceURL: func() string {
+			u := os.Getenv("RIVER_SERVICE_URL")
+			if u == "" {
+				u = "http://10.1.2.19:8081"
+			}
+			return u
+		}(),
+		RiverGo2RTCURL: func() string {
+			u := os.Getenv("RIVER_GO2RTC_URL")
+			if u == "" {
+				u = "http://10.1.2.7:1984"
+			}
+			return u
 		}(),
 	}
 }

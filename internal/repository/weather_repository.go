@@ -24,6 +24,7 @@ const (
 	redisKeyWeatherStationsAll = "chonburi:weather:stations:all"
 	redisTTLWeatherStationsAll = 180 * time.Second
 	l1TTLWeatherStationsAll    = 30 * time.Second
+	redisTTLWeatherForecast    = 15 * time.Minute
 )
 
 type WeatherRepository interface {
@@ -33,6 +34,10 @@ type WeatherRepository interface {
 	GetStationForecast(ctx context.Context, imei string) (map[string]interface{}, error)
 	GetStationGraph(ctx context.Context, imei, variable string, timeframe int, date string) (map[string]interface{}, error)
 	GetMapFrames(ctx context.Context, variable, animType, date string) (map[string]interface{}, error)
+	GetMapTiles(ctx context.Context, variable, animType string) (map[string]interface{}, error)
+	GetMapTilesRange(ctx context.Context, variable, animType, date string, minRow, maxRow, minCol, maxCol int) (map[string]interface{}, error)
+	GetStationMonthlyStats(ctx context.Context, imei string, month, year int) (map[string]interface{}, error)
+	GetSubdistrictForecast(ctx context.Context, district, subdistrict, province string) (map[string]interface{}, error)
 	FlushStationsCache(ctx context.Context) error
 }
 
@@ -177,9 +182,28 @@ func (r *weatherRepository) FetchAllStations(ctx context.Context) (*domain.Weath
 				lat, _ := strconv.ParseFloat(it.Position.Latitude, 64)
 				lng, _ := strconv.ParseFloat(it.Position.Longitude, 64)
 
+				serial := it.Serial
+				if serial == "" {
+					serial = it.RegistedIMEI.Serial
+				}
+				if serial == "" {
+					serial = it.IMEI
+				}
+
+				deviceName := it.StationName
+				if deviceName == "" {
+					deviceName = it.RegistedIMEI.StationName
+				}
+				if deviceName == "" {
+					deviceName = it.RegistedIMEI.CommonSiteName
+				}
+				if deviceName == "" {
+					deviceName = fmt.Sprintf("สถานี %s", serial)
+				}
+
 				siteName := it.RegistedIMEI.CommonSiteName
 				if siteName == "" {
-					siteName = fmt.Sprintf("สถานี : %s", it.IMEI)
+					siteName = deviceName
 				}
 
 				locName := siteName
@@ -198,9 +222,12 @@ func (r *weatherRepository) FetchAllStations(ctx context.Context) (*domain.Weath
 				updatedTime := time.Unix(it.Position.TimeStampUTC, 0).Format("15:04 น.")
 
 				dto := domain.WeatherStationDTO{
-					ID:              it.IMEI,
+					ID:              serial, // Use hardware serial as key
 					IMEI:            it.IMEI,
-					Name:            siteName,
+					Serial:          serial,
+					DeviceName:      deviceName,
+					StationName:     deviceName,
+					Name:            deviceName,
 					LocationName:    locName,
 					AccountID:       it.RegistedIMEI.AccountID,
 					Latitude:        lat,
@@ -224,7 +251,7 @@ func (r *weatherRepository) FetchAllStations(ctx context.Context) (*domain.Weath
 					LastUpdated:     updatedTime,
 				}
 
-				stationMap[it.IMEI] = dto
+				stationMap[serial] = dto
 			}
 		}
 
@@ -296,8 +323,40 @@ func (r *weatherRepository) GetStationByIMEI(ctx context.Context, imei string) (
 }
 
 func (r *weatherRepository) GetStationForecast(ctx context.Context, imei string) (map[string]interface{}, error) {
-	reqURL := fmt.Sprintf("%s/api/v1/weather/forecast/stations/imei/%s", r.cfg.FahfonWeatherBaseURL, url.PathEscape(imei))
-	return r.executeGetJSON(ctx, reqURL)
+	cacheKey := fmt.Sprintf("chonburi:weather:forecast:%s", imei)
+
+	// 1. Check Redis Cache (< 2ms)
+	if r.redisClient != nil && r.redisClient.Client != nil {
+		if cachedJSON, err := r.redisClient.Client.Get(ctx, cacheKey).Result(); err == nil && cachedJSON != "" {
+			var result map[string]interface{}
+			if err := json.Unmarshal([]byte(cachedJSON), &result); err == nil {
+				return result, nil
+			}
+		}
+	}
+
+	// 2. Singleflight to prevent Thundering Herd / Cache Stampede
+	sfKey := fmt.Sprintf("sf_forecast_%s", imei)
+	val, err, _ := r.sf.Do(sfKey, func() (interface{}, error) {
+		reqURL := fmt.Sprintf("%s/api/v1/weather/forecast/stations/imei/%s", r.cfg.FahfonWeatherBaseURL, url.PathEscape(imei))
+		data, err := r.executeGetJSON(ctx, reqURL)
+		if err != nil {
+			return nil, err
+		}
+
+		// Save to Redis (< 15 min TTL)
+		if r.redisClient != nil && r.redisClient.Client != nil && data != nil {
+			if b, err := json.Marshal(data); err == nil {
+				_ = r.redisClient.Client.Set(ctx, cacheKey, string(b), redisTTLWeatherForecast).Err()
+			}
+		}
+		return data, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	return val.(map[string]interface{}), nil
 }
 
 func (r *weatherRepository) GetStationGraph(ctx context.Context, imei, variable string, timeframe int, date string) (map[string]interface{}, error) {
@@ -323,6 +382,115 @@ func (r *weatherRepository) GetMapFrames(ctx context.Context, variable, animType
 		url.QueryEscape(date),
 	)
 	return r.executeGetJSON(ctx, reqURL)
+}
+
+func (r *weatherRepository) GetMapTiles(ctx context.Context, variable, animType string) (map[string]interface{}, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/weather/map/tiles?variable=%s&anim_type=%s",
+		r.cfg.FahfonWeatherBaseURL,
+		url.QueryEscape(variable),
+		url.QueryEscape(animType),
+	)
+	return r.executeGetJSON(ctx, reqURL)
+}
+
+func (r *weatherRepository) GetMapTilesRange(ctx context.Context, variable, animType, date string, minRow, maxRow, minCol, maxCol int) (map[string]interface{}, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/weather/map/tiles/range?variable=%s&anim_type=%s&date=%s&min_row=%d&max_row=%d&min_col=%d&max_col=%d",
+		r.cfg.FahfonWeatherBaseURL,
+		url.QueryEscape(variable),
+		url.QueryEscape(animType),
+		url.QueryEscape(date),
+		minRow, maxRow, minCol, maxCol,
+	)
+	return r.executeGetJSON(ctx, reqURL)
+}
+
+func (r *weatherRepository) GetStationMonthlyStats(ctx context.Context, imei string, month, year int) (map[string]interface{}, error) {
+	var monthStr string
+	if year > 0 && month > 0 {
+		monthStr = fmt.Sprintf("%04d-%02d", year, month)
+	} else if month > 0 {
+		monthStr = fmt.Sprintf("%04d-%02d", time.Now().Year(), month)
+	} else {
+		monthStr = time.Now().Format("2006-01")
+	}
+	reqURL := fmt.Sprintf("%s/api/v1/weather/stations/imei/%s/stats/monthly?month=%s",
+		r.cfg.FahfonWeatherBaseURL,
+		url.PathEscape(imei),
+		url.QueryEscape(monthStr),
+	)
+	return r.executeGetJSON(ctx, reqURL)
+}
+
+func (r *weatherRepository) GetSubdistrictForecast(ctx context.Context, district, subdistrict, province string) (map[string]interface{}, error) {
+	if province == "" {
+		province = "ชลบุรี"
+	}
+	cacheKey := fmt.Sprintf("chonburi:weather:forecast:subdistrict:%s:%s:%s", province, district, subdistrict)
+
+	// 1. Check Redis Cache (< 2ms)
+	if r.redisClient != nil && r.redisClient.Client != nil {
+		if cachedJSON, err := r.redisClient.Client.Get(ctx, cacheKey).Result(); err == nil && cachedJSON != "" {
+			var result map[string]interface{}
+			if err := json.Unmarshal([]byte(cachedJSON), &result); err == nil {
+				return result, nil
+			}
+		}
+	}
+
+	// 2. Singleflight to prevent Thundering Herd / Cache Stampede
+	sfKey := fmt.Sprintf("sf_forecast_subdistrict_%s_%s_%s", province, district, subdistrict)
+	val, err, _ := r.sf.Do(sfKey, func() (interface{}, error) {
+		var reqURL string
+		if subdistrict != "" {
+			reqURL = fmt.Sprintf("%s/api/v1/weather/forecast/by-name?tumbon=%s&amphor=%s&province=%s",
+				r.cfg.FahfonWeatherBaseURL,
+				url.QueryEscape(subdistrict),
+				url.QueryEscape(district),
+				url.QueryEscape(province),
+			)
+		} else {
+			reqURL = fmt.Sprintf("%s/api/v1/weather/forecast/by-district?district=%s&province=%s",
+				r.cfg.FahfonWeatherBaseURL,
+				url.QueryEscape(district),
+				url.QueryEscape(province),
+			)
+		}
+
+		data, err := r.executeGetJSON(ctx, reqURL)
+		if err != nil {
+			return nil, err
+		}
+
+		// High performance fallback: If tumbon has null current, fill with amphor level current & hourly
+		if subdistrict != "" && data != nil && data["current"] == nil {
+			districtURL := fmt.Sprintf("%s/api/v1/weather/forecast/by-district?district=%s&province=%s",
+				r.cfg.FahfonWeatherBaseURL,
+				url.QueryEscape(district),
+				url.QueryEscape(province),
+			)
+			if districtData, dErr := r.executeGetJSON(ctx, districtURL); dErr == nil && districtData != nil {
+				if districtData["current"] != nil {
+					data["current"] = districtData["current"]
+				}
+				if (data["hourly"] == nil || len(data["hourly"].([]interface{})) == 0) && districtData["hourly"] != nil {
+					data["hourly"] = districtData["hourly"]
+				}
+			}
+		}
+
+		// Save to Redis (< 15 min TTL)
+		if r.redisClient != nil && r.redisClient.Client != nil && data != nil {
+			if b, err := json.Marshal(data); err == nil {
+				_ = r.redisClient.Client.Set(ctx, cacheKey, string(b), redisTTLWeatherForecast).Err()
+			}
+		}
+		return data, nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	return val.(map[string]interface{}), nil
 }
 
 func (r *weatherRepository) executeGetJSON(ctx context.Context, reqURL string) (map[string]interface{}, error) {
