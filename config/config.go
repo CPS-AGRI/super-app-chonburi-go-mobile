@@ -56,8 +56,9 @@ type Config struct {
 	FahfonServiceKey     string
 
 	// Fahfon River Microservice (10.1.2.19)
-	RiverServiceURL string
-	RiverGo2RTCURL  string
+	RiverServiceURL     string
+	RiverGo2RTCURL      string
+	RiverMunicipalityID string
 }
 
 type MinIOConfig struct {
@@ -232,6 +233,13 @@ func LoadConfig() *Config {
 				u = "http://10.1.2.7:1984"
 			}
 			return u
+		}(),
+		RiverMunicipalityID: func() string {
+			m := os.Getenv("RIVER_MUNICIPALITY_ID")
+			if m == "" {
+				m = "c04da467-53f7-4076-93e9-54896eedb6c6"
+			}
+			return m
 		}(),
 	}
 }

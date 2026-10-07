@@ -87,6 +87,10 @@ func (r *waterLevelRepository) buildGatewayRequest(ctx context.Context, method, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-gateway-meta-email", "all")
+	if r.cfg.RiverMunicipalityID != "" {
+		req.Header.Set("x-gateway-meta-municipality-id", r.cfg.RiverMunicipalityID)
+		req.Header.Set("x-client-meta-municipality-id", r.cfg.RiverMunicipalityID)
+	}
 	req.Header.Set("x-client-meta-page-code", "water-level-cctv")
 	req.Header.Set("x-gateway-meta-page-code", "water-level-cctv")
 
@@ -103,12 +107,17 @@ func (r *waterLevelRepository) FetchGatewayDevices(ctx context.Context) ([]domai
 	}
 	r.l1Mu.RUnlock()
 
+	redisKey := fmt.Sprintf("chonburi:water:stations:%s", r.cfg.RiverMunicipalityID)
+	if r.cfg.RiverMunicipalityID == "" {
+		redisKey = redisKeyWaterStationsAll
+	}
+
 	// 2. Singleflight coalesce concurrent requests
-	res, err, _ := r.sf.Do("fetch_gateway_devices", func() (interface{}, error) {
+	res, err, _ := r.sf.Do("fetch_gateway_devices_"+r.cfg.RiverMunicipalityID, func() (interface{}, error) {
 		// 3. Check Redis L2 Cache
 		if r.redisClient != nil {
 			var cached []domain.GatewayRiverDevice
-			if err := r.redisClient.GetJSON(ctx, redisKeyWaterStationsAll, &cached); err == nil && len(cached) > 0 {
+			if err := r.redisClient.GetJSON(ctx, redisKey, &cached); err == nil && len(cached) > 0 {
 				r.l1Mu.Lock()
 				r.l1Cache = cached
 				r.l1CachedAt = time.Now()
@@ -148,9 +157,9 @@ func (r *waterLevelRepository) FetchGatewayDevices(ctx context.Context) ([]domai
 
 		// Update L2 Redis Cache asynchronously
 		if r.redisClient != nil {
-			go func(d []domain.GatewayRiverDevice) {
-				_ = r.redisClient.SetJSON(context.Background(), redisKeyWaterStationsAll, d, redisTTLWaterStationsAll)
-			}(devices)
+			go func(d []domain.GatewayRiverDevice, key string) {
+				_ = r.redisClient.SetJSON(context.Background(), key, d, redisTTLWaterStationsAll)
+			}(devices, redisKey)
 		}
 
 		return devices, nil
