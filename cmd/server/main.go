@@ -87,8 +87,8 @@ func main() {
 	http.NewVerificationHandler(app, verificationUseCase, cfg)
 
 	cctvRepo := repository.NewCCTVRepository(database.DB)
-	cctvUseCase := usecase.NewCCTVUseCase(cctvRepo)
-	http.NewCCTVHandler(app, cctvUseCase, cfg)
+	cctvUseCase := usecase.NewCCTVUseCase(cctvRepo, authRepo, cfg, redisClient)
+	http.NewCCTVHandler(app, cctvUseCase, cfg, redisClient)
 
 	analyticsRepo := repository.NewAnalyticsRepository(database.DB)
 	analyticsUseCase := usecase.NewAnalyticsUseCase(analyticsRepo)

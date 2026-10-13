@@ -150,7 +150,7 @@ func (h *AuthHandler) ThaiIDCallback(c fiber.Ctx) error {
 		return c.Status(400).SendString("Authorization code is missing")
 	}
 
-	redirectURL := fmt.Sprintf("chonburiconnext://thaiid?code=%s&state=%s", code, state)
+	redirectURL := fmt.Sprintf("chonburipaoconnext://thaiid?code=%s&state=%s", code, state)
 	return c.Redirect().Status(fiber.StatusFound).To(redirectURL)
 }
 

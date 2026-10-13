@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -59,6 +60,19 @@ type Config struct {
 	RiverServiceURL     string
 	RiverGo2RTCURL      string
 	RiverMunicipalityID string
+
+	// CCTV Partner Integration (Unified Handshake System)
+	CCTVPartnerAPIKey      string
+	CCTVPartnerPortalURL   string
+	CCTVAllowedCallbacks   []string
+	CCTVTicketTTLSeconds   int
+	CCTVVerifyRateLimit    int
+	CCTVHandshakeRateLimit int
+	ThaiIDQRGatewayURL     string
+
+	// Ph6 Integration Specifics
+	PH6ClientID     string
+	PH6ClientSecret string
 }
 
 type MinIOConfig struct {
@@ -241,6 +255,35 @@ func LoadConfig() *Config {
 			}
 			return m
 		}(),
+		CCTVPartnerAPIKey:    os.Getenv("CCTV_PARTNER_API_KEY"),
+		CCTVPartnerPortalURL: os.Getenv("CCTV_PARTNER_PORTAL_URL"),
+		CCTVAllowedCallbacks: func() []string {
+			cb := os.Getenv("CCTV_ALLOWED_CALLBACKS")
+			if cb == "" {
+				return []string{}
+			}
+			parts := strings.Split(cb, ",")
+			var cleaned []string
+			for _, p := range parts {
+				p = strings.TrimSpace(p)
+				if p != "" {
+					cleaned = append(cleaned, p)
+				}
+			}
+			return cleaned
+		}(),
+		CCTVTicketTTLSeconds:   getEnvInt("CCTV_TICKET_TTL_SECONDS", 60),
+		CCTVVerifyRateLimit:    getEnvInt("CCTV_VERIFY_RATE_LIMIT", 60),
+		CCTVHandshakeRateLimit: getEnvInt("CCTV_HANDSHAKE_RATE_LIMIT", 10),
+		ThaiIDQRGatewayURL: func() string {
+			u := os.Getenv("THAIID_QR_GATEWAY_URL")
+			if u == "" {
+				u = "https://thaid.dopa.go.th/oauth/authorize"
+			}
+			return u
+		}(),
+		PH6ClientID:     os.Getenv("PH6_CLIENT_ID"),
+		PH6ClientSecret: os.Getenv("PH6_CLIENT_SECRET"),
 	}
 }
 
