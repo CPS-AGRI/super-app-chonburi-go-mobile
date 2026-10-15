@@ -2,7 +2,6 @@ package usecase_test
 
 import (
 	"errors"
-	"regexp"
 	"testing"
 
 	"super-app-chonburi-go-mobile/config"
@@ -116,6 +115,17 @@ func TestCCTVUseCase_ValidateCallbackURL_SSRFAndWhitelist(t *testing.T) {
 	assert.False(t, uc.ValidateCallbackURL("http://localhost/internal-admin"))
 	assert.False(t, uc.ValidateCallbackURL("javascript:alert(1)"))
 	assert.False(t, uc.ValidateCallbackURL(""))
+
+	// SSRF Defense: Private IP ranges and loopback
+	assert.False(t, uc.ValidateCallbackURL("http://127.0.0.1/admin"))
+	assert.False(t, uc.ValidateCallbackURL("http://10.0.0.1/secret"))
+	assert.False(t, uc.ValidateCallbackURL("http://192.168.1.1/internal"))
+	assert.False(t, uc.ValidateCallbackURL("http://169.254.169.254/metadata"))
+
+	// Path Traversal & Subdomain Confusion Defense
+	assert.False(t, uc.ValidateCallbackURL("https://cctv-partner.com/portal/../admin"))
+	assert.False(t, uc.ValidateCallbackURL("https://cctv-partner.com/portal/%2e%2e/admin"))
+	assert.False(t, uc.ValidateCallbackURL("https://cctv-partner.com/portal.evil.com/steal"))
 }
 
 func TestCCTVUseCase_VerifyTicket_InputValidation(t *testing.T) {
@@ -168,7 +178,8 @@ func TestCCTVUseCase_VerifyTicket_InputValidation(t *testing.T) {
 		assert.True(t, errors.Is(errPh6, usecase.ErrInvalidTicket), "Malformed ticket with Ph6 credentials must be rejected immediately")
 	}
 
-	// 3. Format regex test for valid 256-bit entropy tickets
-	validFormatRegex := regexp.MustCompile(`^TKT_[a-f0-9]{64}$`)
-	assert.True(t, validFormatRegex.MatchString(validSampleTicket))
+	// 3. Zero-allocation validator test for valid 256-bit entropy tickets
+	assert.True(t, usecase.IsValidTicket(validSampleTicket))
+	assert.False(t, usecase.IsValidTicket("TKT_invalid"))
+	assert.False(t, usecase.IsValidTicket(""))
 }

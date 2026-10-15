@@ -2,11 +2,11 @@ package jwtutil
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"super-app-chonburi-go-mobile/config"
-	"super-app-chonburi-go-mobile/pkg/database"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/golang-jwt/jwt/v5"
@@ -28,21 +28,15 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 		}
 
 		if tokenString == "" {
-			var fallbackUserID string
-			if database.DB != nil {
-				err := database.DB.Table("users").Select("id").Limit(1).Scan(&fallbackUserID).Error
-				if err == nil && fallbackUserID != "" {
-					c.Locals("user_id", fallbackUserID)
-					c.Locals("email", "dev@chonburi.go.th")
-					return c.Next()
-				}
-			}
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "Unauthorized: Missing or invalid token",
 			})
 		}
 
 		token, err := jwt.ParseWithClaims(tokenString, &MobileClaims{}, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
 			return []byte(cfg.JWTSecret), nil
 		})
 
@@ -85,6 +79,9 @@ func ExtractUserID(c fiber.Ctx) (string, error) {
 
 func ParseMobileToken(tokenString string, secret string) (*MobileClaims, error) {
 	token, err := jwt.ParseWithClaims(tokenString, &MobileClaims{}, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
 		return []byte(secret), nil
 	})
 	if err != nil {

@@ -2,9 +2,14 @@ package http
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"log"
+	"net/url"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"super-app-chonburi-go-mobile/config"
@@ -15,18 +20,36 @@ import (
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
+	"github.com/skip2/go-qrcode"
 )
+
+type blockedEntry struct {
+	expiresAt time.Time
+}
 
 type cctvHandler struct {
 	useCase     domain.MobileCCTVUseCase
+	authUseCase domain.AuthUseCase
 	cfg         *config.Config
 	redisClient *infrastructure.RedisClient
+	blocklist   sync.Map // key: rate limit key, value: blockedEntry
 }
 
 // NewCCTVHandler registers the Mobile CCTV & Unified Handshake Ticket endpoints.
-func NewCCTVHandler(app *fiber.App, useCase domain.MobileCCTVUseCase, cfg *config.Config, redisClient *infrastructure.RedisClient) {
+func NewCCTVHandler(
+	app *fiber.App,
+	useCase domain.MobileCCTVUseCase,
+	cfg *config.Config,
+	redisClient *infrastructure.RedisClient,
+	authUseCase ...domain.AuthUseCase,
+) {
+	var auc domain.AuthUseCase
+	if len(authUseCase) > 0 {
+		auc = authUseCase[0]
+	}
 	handler := &cctvHandler{
 		useCase:     useCase,
+		authUseCase: auc,
 		cfg:         cfg,
 		redisClient: redisClient,
 	}
@@ -42,24 +65,45 @@ func NewCCTVHandler(app *fiber.App, useCase domain.MobileCCTVUseCase, cfg *confi
 	app.Post("/api/v1/verify-ticket", handler.VerifyTicket)               // Exact Ph6 Next.js endpoint
 	app.Post("/api/v1/external/cctv/verify-ticket", handler.VerifyTicket) // Alias for backwards compatibility
 
-	// 3. Web ThaID Login Landing Page for Partner (Channel 2)
-	app.Get("/sso/login", handler.RenderThaIDLoginPage)        // Exact Ph6 Next.js SSO URL
-	app.Get("/login/cctv/thaid", handler.RenderThaIDLoginPage) // Alias
+	// 3. Web ThaID Login Flow for Partner (Channel 2)
+	app.Get("/sso/login", handler.RenderThaIDLoginPage)              // Exact Ph6 Next.js SSO URL
+	app.Get("/login/cctv/thaid", handler.RenderThaIDLoginPage)       // Alias
+	app.Get("/sso/callback", handler.HandleThaIDCallback)            // Callback handler after ThaID approval
+	app.Get("/sso/simulate-callback", handler.SimulateThaIDCallback) // Dev / UAT Bypass Simulator
 }
 
 func (h *cctvHandler) checkRateLimit(key string, maxRequests int, window time.Duration) bool {
-	if h.redisClient == nil || h.redisClient.Raw() == nil {
-		return true // Fallback if Redis is not configured
+	// L1 Check: Fast in-memory blocklist check with lazy eviction
+	if v, ok := h.blocklist.Load(key); ok {
+		if entry, ok := v.(blockedEntry); ok {
+			if time.Now().Before(entry.expiresAt) {
+				return false // Short-circuit blocked request without hitting Redis
+			}
+		}
+		h.blocklist.Delete(key) // Evict expired entry
 	}
+
+	// Fail-secure: Deny access if Redis client is unavailable
+	if h.redisClient == nil || h.redisClient.Raw() == nil {
+		return false
+	}
+
 	ctx := context.Background()
 	pipe := h.redisClient.Raw().Pipeline()
 	incr := pipe.Incr(ctx, key)
 	pipe.Expire(ctx, key, window)
 	_, err := pipe.Exec(ctx)
 	if err != nil {
-		return true
+		return false // Fail-secure on Redis error
 	}
-	return incr.Val() <= int64(maxRequests)
+
+	if incr.Val() > int64(maxRequests) {
+		// Populate L1 in-memory blocklist for the remainder of the window
+		h.blocklist.Store(key, blockedEntry{expiresAt: time.Now().Add(window)})
+		return false
+	}
+
+	return true
 }
 
 // CreateHandshakeTicket [Channel 1]
@@ -94,7 +138,13 @@ func (h *cctvHandler) CreateHandshakeTicket(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	res, err := h.useCase.CreateHandshakeTicket(userID, input)
+	meta := domain.RequestMetadata{
+		IP:        c.IP(),
+		UserAgent: string(c.Request().Header.UserAgent()),
+		Platform:  "mobile",
+	}
+
+	res, err := h.useCase.CreateHandshakeTicket(userID, input, meta)
 	if err != nil {
 		if errors.Is(err, usecase.ErrUserNotFound) {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
@@ -173,33 +223,66 @@ func (h *cctvHandler) VerifyTicket(c fiber.Ctx) error {
 }
 
 // RenderThaIDLoginPage [Channel 2]
-// Renders an Enterprise-grade Glassmorphism ThaID QR Login Web Page with OWASP Security Headers.
+// Redirects the citizen's browser directly to DOPA Official ThaID Digital-ID login gateway.
+// Official DOPA gateway renders AUTHEN-{txID} QR code with WebSocket live synchronization.
 func (h *cctvHandler) RenderThaIDLoginPage(c fiber.Ctx) error {
 	callbackURL := c.Query("redirect_to")
 	if callbackURL == "" {
 		callbackURL = c.Query("callback_url")
 	}
 	partnerID := c.Query("partner_id")
+	mode := c.Query("mode")
 
 	// Validate Strict Callback Whitelist (OWASP A01 Open Redirect & A10 SSRF Defense)
 	if callbackURL == "" || !h.useCase.ValidateCallbackURL(callbackURL) {
 		return c.Status(fiber.StatusBadRequest).SendString("Invalid or unauthorized callback URL")
 	}
 
-	// OWASP Top 10 Security Headers
-	c.Set("Content-Security-Policy", "default-src 'self' 'unsafe-inline' https:; frame-ancestors 'none';")
-	c.Set("X-Frame-Options", "DENY")
-	c.Set("X-Content-Type-Options", "nosniff")
-	c.Set("Referrer-Policy", "strict-origin-when-cross-origin")
-	c.Set("Content-Type", "text/html; charset=utf-8")
-
-	qrGatewayURL := "https://thaid.dopa.go.th/oauth/authorize"
-	if h.cfg != nil && h.cfg.ThaiIDQRGatewayURL != "" {
-		qrGatewayURL = h.cfg.ThaiIDQRGatewayURL
+	// ThaiD OAuth Configuration for UAT Chonburi (DOPA Auth Gateway)
+	clientID := "RnRBS0JOemx2dUZBSlhmVnNLcXU0VDM5T0J0Y1FDSTY"
+	if h.cfg != nil && h.cfg.ThaiIDClientID != "" {
+		clientID = h.cfg.ThaiIDClientID
 	}
-	qrDataURL := fmt.Sprintf("%s?partner=%s", qrGatewayURL, partnerID)
+	redirectURI := c.BaseURL() + "/sso/callback"
+	scopes := "pid name"
+	state := fmt.Sprintf("cctv_%s_%d", partnerID, time.Now().UnixNano())
 
-	html := fmt.Sprintf(`<!DOCTYPE html>
+	// Persist session state in Redis (TTL: 10 minutes)
+	if h.redisClient != nil {
+		sessionData := map[string]string{
+			"callback_url": callbackURL,
+			"partner_id":   partnerID,
+		}
+		_ = h.redisClient.SetJSON(context.Background(), fmt.Sprintf("cctv_state:%s", state), sessionData, 10*time.Minute)
+	}
+
+	gatewayBase := "https://imauth.bora.dopa.go.th/api/v2/oauth2/auth/"
+	if h.cfg != nil && h.cfg.ThaiIDQRGatewayURL != "" {
+		gatewayBase = h.cfg.ThaiIDQRGatewayURL
+	}
+	separator := "?"
+	if strings.Contains(gatewayBase, "?") {
+		separator = "&"
+	}
+	dopaAuthURL := fmt.Sprintf("%s%sresponse_type=code&client_id=%s&redirect_uri=%s&scope=%s&state=%s",
+		gatewayBase,
+		separator,
+		url.QueryEscape(clientID),
+		url.QueryEscape(redirectURI),
+		url.QueryEscape(scopes),
+		url.QueryEscape(state),
+	)
+
+	// Mode "simulate" renders the dev/tester bypass page
+	if mode == "simulate" {
+		simURL := fmt.Sprintf("/sso/simulate-callback?callback_url=%s&partner_id=%s",
+			url.QueryEscape(callbackURL),
+			url.QueryEscape(partnerID),
+		)
+		qrBytes, _ := qrcode.Encode(dopaAuthURL, qrcode.Medium, 256)
+		qrImgSrc := "data:image/png;base64," + base64.StdEncoding.EncodeToString(qrBytes)
+
+		html := fmt.Sprintf(`<!DOCTYPE html>
 <html lang="th">
 <head>
   <meta charset="UTF-8">
@@ -223,95 +306,154 @@ func (h *cctvHandler) RenderThaIDLoginPage(c fiber.Ctx) error {
       background: rgba(255, 255, 255, 0.08);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
-      border: 1.5px solid rgba(255, 255, 255, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.18);
       border-radius: 28px;
-      padding: 40px 32px;
+      padding: 36px 32px;
       max-width: 440px;
       width: 100%%;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
       text-align: center;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
     }
     .badge {
       display: inline-flex;
       align-items: center;
       gap: 6px;
-      padding: 6px 14px;
       background: rgba(56, 189, 248, 0.15);
       border: 1px solid rgba(56, 189, 248, 0.3);
-      border-radius: 9999px;
-      font-size: 13px;
-      font-weight: 500;
       color: #38bdf8;
-      margin-bottom: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      margin-bottom: 16px;
     }
-    .badge-dot { width: 8px; height: 8px; border-radius: 50%%; background: #38bdf8; animation: pulse 2s infinite; }
-    @keyframes pulse { 0%%, 100%% { opacity: 1; transform: scale(1); } 50%% { opacity: 0.4; transform: scale(0.85); } }
-    h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; color: #ffffff; }
-    p.subtitle { font-size: 14px; color: #cbd5e1; margin-bottom: 28px; line-height: 1.5; }
+    .badge-dot { width: 8px; height: 8px; border-radius: 50%%; background: #38bdf8; }
+    h1 { font-size: 23px; font-weight: 700; margin-bottom: 6px; color: #ffffff; }
+    p.subtitle { font-size: 13.5px; color: #cbd5e1; margin-bottom: 22px; line-height: 1.5; }
     .qr-container {
       background: #ffffff;
-      padding: 20px;
+      padding: 16px;
       border-radius: 20px;
       display: inline-block;
       box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3);
-      margin-bottom: 20px;
+      margin-bottom: 16px;
     }
-    .qr-img { width: 220px; height: 220px; display: block; border-radius: 8px; }
-    .timer-box { font-size: 13px; color: #94a3b8; margin-bottom: 24px; }
-    .timer-val { color: #f59e0b; font-weight: 600; }
-    .pdpa-notice {
-      background: rgba(15, 23, 42, 0.4);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 16px;
-      padding: 14px;
-      font-size: 12px;
-      color: #94a3b8;
-      text-align: left;
-      line-height: 1.6;
+    .qr-img { width: 220px; height: 220px; display: block; border-radius: 6px; }
+    .sim-btn-wrapper { margin-bottom: 18px; }
+    .sim-btn {
+      display: inline-block;
+      width: 100%%;
+      padding: 12px 16px;
+      background: linear-gradient(135deg, rgba(14, 165, 233, 0.35) 0%%, rgba(2, 132, 199, 0.5) 100%%);
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      border-radius: 14px;
+      color: #ffffff;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 600;
+      transition: all 0.2s ease;
+      cursor: pointer;
     }
-    .pdpa-notice strong { color: #e2e8f0; }
   </style>
 </head>
 <body>
   <div class="glass-card">
-    <div class="badge">
-      <span class="badge-dot"></span>
-      ระบบยืนยันตัวตนกลาง อบจ. ชลบุรี
-    </div>
-    <h1>สแกนเพื่อยืนยันตัวตน</h1>
-    <p class="subtitle">เปิดแอปพลิเคชัน <strong>ThaID</strong> บนสมาร์ตโฟนของคุณ<br>เพื่อยืนยันตัวตนเข้าสู่ระบบกล้องวงจรปิด (CCTV)</p>
-    
-    <div class="qr-container">
-      <img class="qr-img" src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=%s" alt="ThaID QR Code">
-    </div>
-
-    <div class="timer-box">
-      รหัส QR มีอายุใช้งานอีก <span class="timer-val" id="countdown">180</span> วินาที
-    </div>
-
-    <div class="pdpa-notice">
-      <strong>🔒 การคุ้มครองข้อมูลส่วนบุคคล (PDPA):</strong><br>
-      ระบบส่งต่อเฉพาะสถานะการรับรองตัวตนและรหัสอ้างอิงความปลอดภัย (User Ref) โดย<strong>ไม่มีการส่งเลขบัตรประชาชน 13 หลัก</strong>ไปยังระบบภายนอก
-    </div>
+    <div class="badge"><span class="badge-dot"></span>จำลองระบบยืนยันตัวตน (Dev Bypass)</div>
+    <h1>จำลองการเข้าสู่ระบบ</h1>
+    <p class="subtitle">โหมดทดสอบสำหรับนักพัฒนาโดยไม่ต้องใช้โทรศัพท์จริง</p>
+    <div class="qr-container"><img class="qr-img" src="%s" alt="ThaID QR"></div>
+    <div class="sim-btn-wrapper"><a href="%s" class="sim-btn">🧪 จำลองการสแกนผ่าน ThaID สำเร็จ</a></div>
   </div>
-
-  <script>
-    let seconds = 180;
-    const timerElem = document.getElementById('countdown');
-    const timer = setInterval(() => {
-      seconds--;
-      if (seconds <= 0) {
-        clearInterval(timer);
-        timerElem.textContent = 'หมดอายุ';
-      } else {
-        timerElem.textContent = seconds;
-      }
-    }, 1000);
-  </script>
 </body>
-</html>`, qrDataURL)
+</html>`, qrImgSrc, simURL)
+		return c.SendString(html)
+	}
 
-	return c.SendString(html)
+	// Default: Direct redirect to official DOPA ThaID Digital-ID gateway
+	log.Printf("🔗 [SSO Login] Redirecting citizen to DOPA Official Gateway: %s", dopaAuthURL)
+	return c.Redirect().To(dopaAuthURL)
+}
+
+// HandleThaIDCallback [Channel 2]
+// Handles the redirect after citizen approves on the official ThaID mobile application.
+func (h *cctvHandler) HandleThaIDCallback(c fiber.Ctx) error {
+	code := c.Query("code")
+	state := c.Query("state")
+	if code == "" || state == "" {
+		return c.Status(fiber.StatusBadRequest).SendString("Missing authorization code or state")
+	}
+
+	// 1. Retrieve session state from Redis
+	stateKey := fmt.Sprintf("cctv_state:%s", state)
+	var session struct {
+		CallbackURL string `json:"callback_url"`
+		PartnerID   string `json:"partner_id"`
+	}
+
+	if h.redisClient != nil {
+		if err := h.redisClient.GetJSON(context.Background(), stateKey, &session); err != nil {
+			log.Printf("⚠️ [SSO Callback] Expired or invalid state: %s (%v)", state, err)
+		} else {
+			_ = h.redisClient.Delete(context.Background(), stateKey)
+		}
+	}
+
+	if session.CallbackURL == "" {
+		session.CallbackURL = "http://localhost:3000/portal"
+	}
+	if session.PartnerID == "" {
+		session.PartnerID = "ph6"
+	}
+
+	redirectURI := c.BaseURL() + "/sso/callback"
+
+	if h.authUseCase == nil {
+		log.Printf("❌ [SSO Callback] authUseCase not injected")
+		return c.Status(fiber.StatusInternalServerError).SendString("Authentication system unavailable")
+	}
+
+	authResp, err := h.authUseCase.LoginWithThaiID(code, redirectURI)
+	if err != nil {
+		log.Printf("❌ [SSO Callback] LoginWithThaiID failed: %v", err)
+		return c.Status(fiber.StatusUnauthorized).SendString(fmt.Sprintf("ThaID verification failed: %v", err))
+	}
+
+	if authResp == nil || authResp.User == nil {
+		return c.Status(fiber.StatusUnauthorized).SendString("User not verified")
+	}
+
+	// 3. Create Web Handshake Ticket
+	redirectTarget, err := h.useCase.CreateWebHandshakeTicket(authResp.User.ID, session.CallbackURL, session.PartnerID)
+	if err != nil {
+		log.Printf("❌ [SSO Callback] CreateWebHandshakeTicket failed: %v", err)
+		return c.Status(fiber.StatusInternalServerError).SendString(fmt.Sprintf("Failed to generate ticket: %v", err))
+	}
+
+	log.Printf("✅ [SSO Callback] ThaID Login Success for User %s. Redirecting to: %s", authResp.User.ID, redirectTarget)
+	return c.Redirect().To(redirectTarget)
+}
+
+// SimulateThaIDCallback [Dev/UAT Simulator]
+// Allows developers/testers to simulate a successful ThaID QR scan without mobile devices.
+func (h *cctvHandler) SimulateThaIDCallback(c fiber.Ctx) error {
+	callbackURL := c.Query("redirect_to")
+	if callbackURL == "" {
+		callbackURL = c.Query("callback_url")
+	}
+	partnerID := c.Query("partner_id")
+
+	if callbackURL == "" || !h.useCase.ValidateCallbackURL(callbackURL) {
+		return c.Status(fiber.StatusBadRequest).SendString("Invalid or unauthorized callback URL")
+	}
+
+	// Use Somchai (ThaID verified test user in UAT DB)
+	testUserID, _ := uuid.Parse("1a5152bd-d98f-448c-865c-6f74fe47e1ea")
+	targetURL, err := h.useCase.CreateWebHandshakeTicket(testUserID, callbackURL, partnerID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).SendString("Failed to generate simulation ticket: " + err.Error())
+	}
+
+	return c.Redirect().To(targetURL)
 }
 
 func (h *cctvHandler) GetCameras(c fiber.Ctx) error {

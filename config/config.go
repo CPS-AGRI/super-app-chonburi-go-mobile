@@ -110,8 +110,8 @@ func LoadConfig() *Config {
 	}
 
 	jwtSecret := os.Getenv("JWT_SECRET")
-	if jwtSecret == "" {
-		jwtSecret = "chonburi-plus-mobile-secret-key-2024"
+	if jwtSecret == "" || len(jwtSecret) < 32 {
+		log.Fatal("❌ FATAL: JWT_SECRET environment variable is required and must be at least 32 bytes")
 	}
 
 	taxUploadDir := os.Getenv("TAX_UPLOAD_DIR")
@@ -164,10 +164,22 @@ func LoadConfig() *Config {
 		FacebookAppSecret:  os.Getenv("FACEBOOK_APP_SECRET"),
 		LineChannelID:      os.Getenv("LINE_CHANNEL_ID"),
 		LineChannelSecret:  os.Getenv("LINE_CHANNEL_SECRET"),
-		ThaiIDClientID:     os.Getenv("THAIID_CLIENT_ID"),
+		ThaiIDClientID: func() string {
+			cid := os.Getenv("THAIID_CLIENT_ID")
+			if cid == "" {
+				cid = "RnRBS0JOemx2dUZBSlhmVnNLcXU0VDM5T0J0Y1FDSTY"
+			}
+			return cid
+		}(),
 		ThaiIDClientSecret: os.Getenv("THAIID_CLIENT_SECRET"),
 		ThaiIDApiKey:       os.Getenv("THAIID_API_KEY"),
-		ThaiIDRedirectURI:  os.Getenv("THAIID_REDIRECT_URI"),
+		ThaiIDRedirectURI: func() string {
+			uri := os.Getenv("THAIID_REDIRECT_URI")
+			if uri == "" {
+				uri = "https://uat-super-app-chonburi.mueangsmart.com/thaiid-callback"
+			}
+			return uri
+		}(),
 		PIDHmacSecret:     os.Getenv("PID_HMAC_SECRET"),
 		PIDEncryptionKey:  os.Getenv("PID_ENCRYPTION_KEY"),
 		SMTPHost:           os.Getenv("SMTP_HOST"),
@@ -278,7 +290,7 @@ func LoadConfig() *Config {
 		ThaiIDQRGatewayURL: func() string {
 			u := os.Getenv("THAIID_QR_GATEWAY_URL")
 			if u == "" {
-				u = "https://thaid.dopa.go.th/oauth/authorize"
+				u = "https://imauth.bora.dopa.go.th/api/v2/oauth2/auth/"
 			}
 			return u
 		}(),

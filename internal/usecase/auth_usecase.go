@@ -974,6 +974,14 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 		displayName, _ := thaiIDProfile["name"].(string)
 		if displayName == "" {
 			displayName = givenName + " " + familyName
+		} else if givenName == "" && familyName == "" {
+			parts := strings.Fields(displayName)
+			if len(parts) >= 2 {
+				givenName = parts[0]
+				familyName = strings.Join(parts[1:], " ")
+			} else {
+				givenName = displayName
+			}
 		}
 		title, _ := thaiIDProfile["titleTh"].(string)
 		if title == "" {
@@ -1070,6 +1078,16 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 		if isPlaceholderName(user.Information.Name) {
 			givenName, _ := thaiIDProfile["given_name"].(string)
 			familyName, _ := thaiIDProfile["family_name"].(string)
+			displayName, _ := thaiIDProfile["name"].(string)
+			if givenName == "" && familyName == "" && displayName != "" {
+				parts := strings.Fields(displayName)
+				if len(parts) >= 2 {
+					givenName = parts[0]
+					familyName = strings.Join(parts[1:], " ")
+				} else {
+					givenName = displayName
+				}
+			}
 			if givenName != "" {
 				user.Information.Name = givenName
 				userUpdated = true

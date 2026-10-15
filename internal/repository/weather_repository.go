@@ -472,7 +472,8 @@ func (r *weatherRepository) GetSubdistrictForecast(ctx context.Context, district
 				if districtData["current"] != nil {
 					data["current"] = districtData["current"]
 				}
-				if (data["hourly"] == nil || len(data["hourly"].([]interface{})) == 0) && districtData["hourly"] != nil {
+				hourlyList, isList := data["hourly"].([]interface{})
+				if (!isList || len(hourlyList) == 0) && districtData["hourly"] != nil {
 					data["hourly"] = districtData["hourly"]
 				}
 			}

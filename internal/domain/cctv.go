@@ -80,10 +80,17 @@ type MobileCCTVUseCase interface {
 	GetMyRequests(userID uuid.UUID) ([]CCTVRequest, error)
 
 	// Unified Ticket Handshake System (Channel 1 & Channel 2)
-	CreateHandshakeTicket(userID uuid.UUID, input CreateHandshakeTicketInput) (*CreateHandshakeTicketResponse, error)
+	CreateHandshakeTicket(userID uuid.UUID, input CreateHandshakeTicketInput, meta ...RequestMetadata) (*CreateHandshakeTicketResponse, error)
 	VerifyHandshakeTicket(partnerHeaderKey string, input VerifyTicketInput) (*VerifyTicketResponse, error)
 	CreateWebHandshakeTicket(userID uuid.UUID, callbackURL, partnerID string) (string, error)
 	ValidateCallbackURL(callbackURL string) bool
+}
+
+// RequestMetadata holds client context for analytics and audit logging.
+type RequestMetadata struct {
+	IP        string
+	UserAgent string
+	Platform  string
 }
 
 // CCTVHandshakeTicket represents a single-use ephemeral ticket for partner handshake.
@@ -129,20 +136,18 @@ type TimeWindow struct {
 type TicketPermissions struct {
 	AllowedCCTVID string      `json:"allowed_cctv_id,omitempty"`
 	CanViewLive   bool        `json:"can_view_live"`
-	CanDownload   bool        `json:"can_download"`
 	TimeWindow    *TimeWindow `json:"time_window,omitempty"`
 }
 
 type VerifyTicketResponse struct {
-	Success         bool              `json:"success"`
-	UserIdentity    string            `json:"user_identity"`               // Required by Ph6 (Unique ID of user)
-	Name            string            `json:"name,omitempty"`              // Required by Ph6 (Display Name)
-	UserReferenceID string            `json:"user_reference_id,omitempty"` // Pseudonymous ID
-	UserStatus      string            `json:"user_status"`                 // "active"
-	AuthChannel     string            `json:"auth_channel"`                // "thaid"
-	IsThaIDVerified bool              `json:"is_thaid_verified"`           // true
-	Permissions     TicketPermissions `json:"permissions,omitempty"`
-	IssuedAt        string            `json:"issued_at,omitempty"`
-	ExpiresAt       string            `json:"expires_at,omitempty"`
+	Success         bool   `json:"success"`
+	UserIdentity    string `json:"user_identity"`               // Required by Ph6 (Unique ID of user)
+	Name            string `json:"name,omitempty"`              // Required by Ph6 (Display Name)
+	UserReferenceID string `json:"user_reference_id,omitempty"` // Pseudonymous ID
+	UserStatus      string `json:"user_status"`                 // "active"
+	AuthChannel     string `json:"auth_channel"`                // "thaid"
+	IsThaIDVerified bool   `json:"is_thaid_verified"`           // true
+	IssuedAt        string `json:"issued_at,omitempty"`
+	ExpiresAt       string `json:"expires_at,omitempty"`
 }
 

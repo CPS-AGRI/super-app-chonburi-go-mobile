@@ -3,14 +3,17 @@ package usecase
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/url"
-	"regexp"
+	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"super-app-chonburi-go-mobile/config"
@@ -18,6 +21,7 @@ import (
 	"super-app-chonburi-go-mobile/internal/infrastructure"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -27,14 +31,43 @@ var (
 	ErrRateLimitExceeded   = errors.New("RATE_LIMIT_EXCEEDED")
 	ErrInvalidCallbackURL  = errors.New("INVALID_CALLBACK_URL")
 	ErrUserNotFound        = errors.New("USER_NOT_FOUND_IN_SYSTEM")
-	ticketFormatRegex      = regexp.MustCompile(`^TKT_[a-f0-9]{64}$`)
+
+	// Pre-compiled atomic Lua script for single-use ticket invalidation fallback (Redis < 6.2)
+	getDelLuaScript = redis.NewScript(`
+		local val = redis.call("GET", KEYS[1])
+		if val then
+			redis.call("DEL", KEYS[1])
+		end
+		return val
+	`)
 )
 
+// IsValidTicket validates ticket format (TKT_ prefix + 64 lowercase hex chars) with zero heap allocations.
+func IsValidTicket(t string) bool {
+	const prefix = "TKT_"
+	const expectedLen = 4 + 64
+	if len(t) != expectedLen {
+		return false
+	}
+	if t[0] != 'T' || t[1] != 'K' || t[2] != 'T' || t[3] != '_' {
+		return false
+	}
+	for i := 4; i < expectedLen; i++ {
+		c := t[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 type cctvUseCase struct {
-	repo        domain.MobileCCTVRepository
-	authRepo    domain.AuthRepository
-	cfg         *config.Config
-	redisClient *infrastructure.RedisClient
+	repo           domain.MobileCCTVRepository
+	authRepo       domain.AuthRepository
+	cfg            *config.Config
+	redisClient    *infrastructure.RedisClient
+	analyticsUC    domain.AnalyticsUseCase
+	supportsGetDel atomic.Bool
 }
 
 // NewCCTVUseCase creates a new MobileCCTVUseCase with unified ticket handshake capabilities.
@@ -43,13 +76,21 @@ func NewCCTVUseCase(
 	authRepo domain.AuthRepository,
 	cfg *config.Config,
 	redisClient *infrastructure.RedisClient,
+	analyticsUC ...domain.AnalyticsUseCase,
 ) domain.MobileCCTVUseCase {
-	return &cctvUseCase{
+	var auc domain.AnalyticsUseCase
+	if len(analyticsUC) > 0 {
+		auc = analyticsUC[0]
+	}
+	uc := &cctvUseCase{
 		repo:        repo,
 		authRepo:    authRepo,
 		cfg:         cfg,
 		redisClient: redisClient,
+		analyticsUC: auc,
 	}
+	uc.supportsGetDel.Store(true)
+	return uc
 }
 
 func (u *cctvUseCase) GetCameras(query domain.MobileCCTVQuery) ([]domain.CCTV, error) {
@@ -125,7 +166,7 @@ func (u *cctvUseCase) getVerifiedUser(userID uuid.UUID) (*domain.AppUser, bool, 
 
 // CreateHandshakeTicket generates a single-use ephemeral ticket (TTL 60s) for Channel 1.
 // Strict Gatekeeper: Must exist in our database and be verified with ThaID for download action.
-func (u *cctvUseCase) CreateHandshakeTicket(userID uuid.UUID, input domain.CreateHandshakeTicketInput) (*domain.CreateHandshakeTicketResponse, error) {
+func (u *cctvUseCase) CreateHandshakeTicket(userID uuid.UUID, input domain.CreateHandshakeTicketInput, meta ...domain.RequestMetadata) (*domain.CreateHandshakeTicketResponse, error) {
 	if userID == uuid.Nil {
 		return nil, errors.New("unauthorized user")
 	}
@@ -144,6 +185,14 @@ func (u *cctvUseCase) CreateHandshakeTicket(userID uuid.UUID, input domain.Creat
 	displayName := ""
 	if user.Information != nil {
 		displayName = strings.TrimSpace(user.Information.Name + " " + user.Information.LastName)
+	}
+	if displayName == "" && len(user.OauthAccounts) > 0 {
+		for _, acc := range user.OauthAccounts {
+			if strings.TrimSpace(acc.DisplayName) != "" {
+				displayName = strings.TrimSpace(acc.DisplayName)
+				break
+			}
+		}
 	}
 
 	// Generate high-entropy ticket ID (256 bits of entropy = 32 bytes = 64 hex characters)
@@ -184,6 +233,69 @@ func (u *cctvUseCase) CreateHandshakeTicket(userID uuid.UUID, input domain.Creat
 		return nil, errors.New("distributed cache not available")
 	}
 
+	// 1. Record CCTV Request History in DB (module_cctv_requests)
+	if strings.EqualFold(input.Action, "download") && u.repo != nil {
+		var cctvUUID uuid.UUID
+		if parsed, parseErr := uuid.Parse(input.CCTVID); parseErr == nil {
+			cctvUUID = parsed
+		}
+		startTime := input.StartTime
+		if startTime == "" {
+			startTime = "00:00"
+		}
+		endTime := input.EndTime
+		if endTime == "" {
+			endTime = "23:59"
+		}
+		cctvReq := &domain.CCTVRequest{
+			ID:              uuid.New(),
+			UserID:          userID,
+			CCTVID:          cctvUUID,
+			IncidentDate:    now,
+			StartTime:       startTime,
+			EndTime:         endTime,
+			Reason:          "ขอดูกล้องย้อนหลังผ่านระบบ Handshake",
+			EvidenceFileURL: "HANDSHAKE_TICKET:" + ticketID,
+			Status:          "PENDING",
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+		go func(r *domain.CCTVRequest) {
+			if createErr := u.repo.CreateRequest(r); createErr != nil {
+				log.Printf("⚠️ [CCTV Request DB Log] Failed to record CCTV request history: %v", createErr)
+			}
+		}(cctvReq)
+	}
+
+	// 2. Extract Client Metadata for KPI and Audit Logging
+	var ip, userAgent, platform string
+	if len(meta) > 0 {
+		ip = meta[0].IP
+		userAgent = meta[0].UserAgent
+		platform = meta[0].Platform
+	}
+	if platform == "" {
+		platform = "mobile"
+	}
+
+	// 3. KPI Log: Track module usage in module_usage_logs
+	if u.analyticsUC != nil {
+		go func(uid uuid.UUID, clientIP, uAgent, plt string) {
+			usageDTO := &domain.RecordModuleUsageDTO{
+				ModuleCode: "cctv",
+				Action:     "HANDSHAKE_TICKET_REQUEST",
+				Platform:   plt,
+			}
+			if trackErr := u.analyticsUC.TrackModuleUsage(usageDTO, &uid, clientIP, uAgent); trackErr != nil {
+				log.Printf("⚠️ [CCTV KPI Log] Failed to track module usage: %v", trackErr)
+			}
+		}(userID, ip, userAgent, platform)
+	}
+
+	// 4. Structured Security Audit Log
+	log.Printf("[AUDIT] CCTV_HANDSHAKE_ISSUED: ticket=%s user_id=%s cctv_id=%s action=%s is_thaid_verified=%t ip=%s",
+		ticketID, userID.String(), input.CCTVID, input.Action, isThaIDVerified, ip)
+
 	portalURL := ""
 	if u.cfg != nil {
 		portalURL = u.cfg.CCTVPartnerPortalURL
@@ -206,26 +318,30 @@ func (u *cctvUseCase) CreateHandshakeTicket(userID uuid.UUID, input domain.Creat
 }
 
 // VerifyHandshakeTicket validates and atomically invalidates a ticket (Channel 1 & Channel 2).
-// OWASP Top 10 Hardened: Single-use Lua atomic get+del, Strict Regex, Zero Sensitive PII.
+// OWASP Top 10 Hardened: Adaptive Native GETDEL/Lua Invalidation, Constant-time Compare, Zero-Alloc Validator.
 func (u *cctvUseCase) VerifyHandshakeTicket(partnerHeaderKey string, input domain.VerifyTicketInput) (*domain.VerifyTicketResponse, error) {
-	// 1. Authenticate Partner (support both Ph6 client_id/client_secret in body and X-Partner-API-Key in header)
+	// 1. Authenticate Partner (Timing-attack resilient comparison for credentials and API keys)
 	isAuthorized := false
-	if input.ClientID != "" && input.ClientSecret != "" {
-		if (u.cfg != nil && u.cfg.PH6ClientID != "" && input.ClientID == u.cfg.PH6ClientID && input.ClientSecret == u.cfg.PH6ClientSecret) ||
-			(u.cfg != nil && u.cfg.CCTVPartnerAPIKey != "" && input.ClientSecret == u.cfg.CCTVPartnerAPIKey) {
+	if u.cfg != nil {
+		cidMatch := subtle.ConstantTimeCompare([]byte(input.ClientID), []byte(u.cfg.PH6ClientID)) == 1 && u.cfg.PH6ClientID != ""
+		csecMatch := subtle.ConstantTimeCompare([]byte(input.ClientSecret), []byte(u.cfg.PH6ClientSecret)) == 1 && u.cfg.PH6ClientSecret != ""
+		ph6Valid := cidMatch && csecMatch
+
+		partnerKeyMatch := subtle.ConstantTimeCompare([]byte(input.ClientSecret), []byte(u.cfg.CCTVPartnerAPIKey)) == 1 && u.cfg.CCTVPartnerAPIKey != ""
+		headerKeyMatch := subtle.ConstantTimeCompare([]byte(partnerHeaderKey), []byte(u.cfg.CCTVPartnerAPIKey)) == 1 && u.cfg.CCTVPartnerAPIKey != ""
+
+		if (input.ClientID != "" && input.ClientSecret != "" && (ph6Valid || partnerKeyMatch)) || (partnerHeaderKey != "" && headerKeyMatch) {
 			isAuthorized = true
 		}
-	} else if partnerHeaderKey != "" && u.cfg != nil && u.cfg.CCTVPartnerAPIKey != "" && partnerHeaderKey == u.cfg.CCTVPartnerAPIKey {
-		isAuthorized = true
 	}
 
 	if !isAuthorized {
 		return nil, ErrUnauthorizedPartner
 	}
 
-	// 2. Strict Input Validation (OWASP A03 Injection Defense)
+	// 2. Strict Input Validation (Zero-alloc byte comparison, OWASP A03 Injection Defense)
 	ticket := strings.TrimSpace(input.Ticket)
-	if !ticketFormatRegex.MatchString(ticket) {
+	if !IsValidTicket(ticket) {
 		return nil, ErrInvalidTicket
 	}
 
@@ -236,21 +352,36 @@ func (u *cctvUseCase) VerifyHandshakeTicket(partnerHeaderKey string, input domai
 	ctx := context.Background()
 	ticketKey := "cctv:ticket:" + ticket
 
-	// 3. Atomic Single-Use Invalidation (OWASP A04 Anti-Replay Attack)
-	luaScript := `
-		local val = redis.call("GET", KEYS[1])
-		if val then
-			redis.call("DEL", KEYS[1])
-		end
-		return val
-	`
-	res, err := u.redisClient.Raw().Eval(ctx, luaScript, []string{ticketKey}).Result()
-	if err != nil || res == nil {
-		return nil, ErrInvalidTicket
+	// 3. Atomic Single-Use Invalidation (Adaptive GETDEL with Lua Script fallback)
+	var ticketJSON string
+	if u.supportsGetDel.Load() {
+		res, err := u.redisClient.Raw().GetDel(ctx, ticketKey).Result()
+		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				return nil, ErrInvalidTicket
+			}
+			if strings.Contains(strings.ToLower(err.Error()), "unknown command") {
+				u.supportsGetDel.Store(false)
+				luaRes, luaErr := getDelLuaScript.Run(ctx, u.redisClient.Raw(), []string{ticketKey}).Result()
+				if luaErr != nil || luaRes == nil {
+					return nil, ErrInvalidTicket
+				}
+				ticketJSON, _ = luaRes.(string)
+			} else {
+				return nil, ErrInvalidTicket
+			}
+		} else {
+			ticketJSON = res
+		}
+	} else {
+		luaRes, luaErr := getDelLuaScript.Run(ctx, u.redisClient.Raw(), []string{ticketKey}).Result()
+		if luaErr != nil || luaRes == nil {
+			return nil, ErrInvalidTicket
+		}
+		ticketJSON, _ = luaRes.(string)
 	}
 
-	ticketJSON, ok := res.(string)
-	if !ok || ticketJSON == "" {
+	if ticketJSON == "" {
 		return nil, ErrInvalidTicket
 	}
 
@@ -264,17 +395,12 @@ func (u *cctvUseCase) VerifyHandshakeTicket(partnerHeaderKey string, input domai
 		return nil, ErrInvalidTicket
 	}
 
-	canDownload := strings.EqualFold(storedTicket.Action, "download") && storedTicket.IsThaIDVerified
-
-	var timeWindow *domain.TimeWindow
-	if storedTicket.StartTime != "" || storedTicket.EndTime != "" {
-		timeWindow = &domain.TimeWindow{
-			StartTime: storedTicket.StartTime,
-			EndTime:   storedTicket.EndTime,
-		}
-	}
-
 	// 5. Data Minimization: Return assertion and pseudonymous user ref ONLY (No citizen ID)
+	// The decision on footage download request approval resides entirely on the partner system.
+	// Structured Security Audit Log:
+	log.Printf("[AUDIT] CCTV_HANDSHAKE_VERIFIED: ticket=%s user_ref=%s is_thaid_verified=%t cctv_id=%s",
+		ticket, storedTicket.UserReferenceID, storedTicket.IsThaIDVerified, storedTicket.CCTVID)
+
 	// Output fields strictly match Ph6 Specification: success, user_identity, name
 	return &domain.VerifyTicketResponse{
 		Success:         true,
@@ -284,14 +410,8 @@ func (u *cctvUseCase) VerifyHandshakeTicket(partnerHeaderKey string, input domai
 		UserStatus:      "active",
 		AuthChannel:     storedTicket.AuthChannel,
 		IsThaIDVerified: storedTicket.IsThaIDVerified,
-		Permissions: domain.TicketPermissions{
-			AllowedCCTVID: storedTicket.CCTVID,
-			CanViewLive:   true,
-			CanDownload:   canDownload,
-			TimeWindow:    timeWindow,
-		},
-		IssuedAt:  storedTicket.IssuedAt.Format(time.RFC3339),
-		ExpiresAt: storedTicket.ExpiresAt.Format(time.RFC3339),
+		IssuedAt:        storedTicket.IssuedAt.Format(time.RFC3339),
+		ExpiresAt:       storedTicket.ExpiresAt.Format(time.RFC3339),
 	}, nil
 }
 
@@ -306,12 +426,58 @@ func (u *cctvUseCase) ValidateCallbackURL(callbackURL string) bool {
 		return false
 	}
 
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && scheme != "http" {
+		return false
+	}
+
+	hostname := strings.ToLower(parsed.Hostname())
+	if hostname == "" {
+		return false
+	}
+
+	// SSRF Defense: Identify localhost and private/loopback/link-local IP addresses
+	isPrivateHost := false
+	if hostname == "localhost" {
+		isPrivateHost = true
+	} else if ip := net.ParseIP(hostname); ip != nil {
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+			isPrivateHost = true
+		}
+	} else {
+		privatePrefixes := []string{"127.", "10.", "192.168.", "169.254."}
+		for _, prefix := range privatePrefixes {
+			if strings.HasPrefix(hostname, prefix) {
+				isPrivateHost = true
+				break
+			}
+		}
+	}
+
+	if u.cfg == nil {
+		return false
+	}
+
+	cleanCallbackPath := path.Clean(parsed.Path)
 	for _, allowed := range u.cfg.CCTVAllowedCallbacks {
 		allowed = strings.TrimSpace(allowed)
 		if allowed == "" {
 			continue
 		}
-		if strings.HasPrefix(callbackURL, allowed) {
+		allowedParsed, err := url.Parse(allowed)
+		if err != nil || !allowedParsed.IsAbs() {
+			continue
+		}
+		if strings.EqualFold(parsed.Scheme, allowedParsed.Scheme) &&
+			strings.EqualFold(parsed.Host, allowedParsed.Host) &&
+			cleanCallbackPath == path.Clean(allowedParsed.Path) {
+			// If it's a private host/localhost, it is only allowed if explicitly configured in the allowed whitelist
+			if isPrivateHost {
+				if strings.EqualFold(allowedParsed.Hostname(), hostname) {
+					return true
+				}
+				return false
+			}
 			return true
 		}
 	}
@@ -337,6 +503,14 @@ func (u *cctvUseCase) CreateWebHandshakeTicket(userID uuid.UUID, callbackURL, pa
 	displayName := ""
 	if user.Information != nil {
 		displayName = strings.TrimSpace(user.Information.Name + " " + user.Information.LastName)
+	}
+	if displayName == "" && len(user.OauthAccounts) > 0 {
+		for _, acc := range user.OauthAccounts {
+			if strings.TrimSpace(acc.DisplayName) != "" {
+				displayName = strings.TrimSpace(acc.DisplayName)
+				break
+			}
+		}
 	}
 
 	ticketBytes := make([]byte, 32)

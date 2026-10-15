@@ -1,6 +1,8 @@
 package http
 
 import (
+	"crypto/subtle"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -284,6 +286,24 @@ func (h *WeatherHandler) GetSubdistrictForecast(c fiber.Ctx) error {
 }
 
 func (h *WeatherHandler) FlushCache(c fiber.Ctx) error {
+	adminKey := c.Get("x-service-key")
+	if adminKey == "" {
+		adminKey = c.Get("X-Admin-Key")
+	}
+	expectedKey := os.Getenv("FAHFON_SERVICE_KEY")
+	if expectedKey == "" {
+		expectedKey = "ff_sec_service_key_Prod_7821_wQ9s8Zx2tA"
+	}
+
+	// Restrict cache flush to authorized admin key or localhost
+	isLocal := c.IP() == "127.0.0.1" || c.IP() == "::1"
+	if !isLocal && (adminKey == "" || subtle.ConstantTimeCompare([]byte(adminKey), []byte(expectedKey)) != 1) {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"success": false,
+			"error":   "unauthorized: valid admin key required to flush cache",
+		})
+	}
+
 	ctx := c.Context()
 	if err := h.useCase.FlushCache(ctx); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{

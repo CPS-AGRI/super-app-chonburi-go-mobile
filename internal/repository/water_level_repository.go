@@ -25,6 +25,10 @@ const (
 	redisKeyWaterStationsAll = "chonburi:water:stations:all"
 	redisTTLWaterStationsAll = 120 * time.Second
 	l1TTLWaterStationsAll    = 20 * time.Second
+
+	redisKeyActiveAlerts = "chonburi:water:alerts:active"
+	redisTTLActiveAlerts = 15 * time.Second
+	l1TTLActiveAlerts    = 5 * time.Second
 )
 
 type WaterLevelRepository interface {
@@ -48,6 +52,10 @@ type waterLevelRepository struct {
 	l1Mu       sync.RWMutex
 	l1Cache    []domain.GatewayRiverDevice
 	l1CachedAt time.Time
+
+	l1AlertsMu       sync.RWMutex
+	l1AlertsCache    []domain.GatewayAlertItem
+	l1AlertsCachedAt time.Time
 }
 
 func NewWaterLevelRepository(db *gorm.DB, cfg *config.Config, redisClient *infrastructure.RedisClient) WaterLevelRepository {
@@ -86,11 +94,13 @@ func (r *waterLevelRepository) buildGatewayRequest(ctx context.Context, method, 
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("x-gateway-meta-email", "all")
-	if r.cfg.RiverMunicipalityID != "" {
-		req.Header.Set("x-gateway-meta-municipality-id", r.cfg.RiverMunicipalityID)
-		req.Header.Set("x-client-meta-municipality-id", r.cfg.RiverMunicipalityID)
+	
+	muniID := r.cfg.RiverMunicipalityID
+	if muniID == "" {
+		muniID = "c04da467-53f7-4076-93e9-54896eedb6c6"
 	}
+	req.Header.Set("x-gateway-meta-municipality-id", muniID)
+	req.Header.Set("x-client-meta-municipality-id", muniID)
 	req.Header.Set("x-client-meta-page-code", "water-level-cctv")
 	req.Header.Set("x-gateway-meta-page-code", "water-level-cctv")
 
@@ -112,19 +122,28 @@ func (r *waterLevelRepository) FetchGatewayDevices(ctx context.Context) ([]domai
 		redisKey = redisKeyWaterStationsAll
 	}
 
-	// 2. Singleflight coalesce concurrent requests
-	res, err, _ := r.sf.Do("fetch_gateway_devices_"+r.cfg.RiverMunicipalityID, func() (interface{}, error) {
-		// 3. Check Redis L2 Cache
-		if r.redisClient != nil {
-			var cached []domain.GatewayRiverDevice
-			if err := r.redisClient.GetJSON(ctx, redisKey, &cached); err == nil && len(cached) > 0 {
-				r.l1Mu.Lock()
-				r.l1Cache = cached
-				r.l1CachedAt = time.Now()
-				r.l1Mu.Unlock()
-				return cached, nil
-			}
+	// 2. Check Redis L2 Cache before Singleflight (High performance alignment)
+	if r.redisClient != nil {
+		var cached []domain.GatewayRiverDevice
+		if err := r.redisClient.GetJSON(ctx, redisKey, &cached); err == nil && len(cached) > 0 {
+			r.l1Mu.Lock()
+			r.l1Cache = cached
+			r.l1CachedAt = time.Now()
+			r.l1Mu.Unlock()
+			return cached, nil
 		}
+	}
+
+	// 3. Singleflight coalesce concurrent requests on cache miss
+	res, err, _ := r.sf.Do("fetch_gateway_devices_"+r.cfg.RiverMunicipalityID, func() (interface{}, error) {
+		// Re-check L1 in case populated while waiting for singleflight slot
+		r.l1Mu.RLock()
+		if r.l1Cache != nil && time.Since(r.l1CachedAt) < l1TTLWaterStationsAll {
+			cached := r.l1Cache
+			r.l1Mu.RUnlock()
+			return cached, nil
+		}
+		r.l1Mu.RUnlock()
 
 		// 4. Fetch Live from ff-river-services
 		req, err := r.buildGatewayRequest(ctx, http.MethodGet, "/api/v1/river/devices", nil)
@@ -309,67 +328,129 @@ func (r *waterLevelRepository) TerminateGatewayStream(ctx context.Context, seria
 }
 
 func (r *waterLevelRepository) FetchActiveAlerts(ctx context.Context) ([]domain.GatewayAlertItem, error) {
-	// First try internal alerts endpoint (no meta required)
-	baseURL := r.cfg.RiverServiceURL
-	if baseURL == "" {
-		baseURL = "http://10.1.2.19:8081"
+	// 1. Check L1 Memory Cache (< 1ms)
+	r.l1AlertsMu.RLock()
+	if r.l1AlertsCache != nil && time.Since(r.l1AlertsCachedAt) < l1TTLActiveAlerts {
+		cached := r.l1AlertsCache
+		r.l1AlertsMu.RUnlock()
+		return cached, nil
 	}
-	path := fmt.Sprintf("%s/api/v1/internal/alerts/active", baseURL)
+	r.l1AlertsMu.RUnlock()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
+	// 2. Check L2 Redis Cache (< 2ms)
+	if r.redisClient != nil {
+		var cached []domain.GatewayAlertItem
+		if err := r.redisClient.GetJSON(ctx, redisKeyActiveAlerts, &cached); err == nil && len(cached) > 0 {
+			r.l1AlertsMu.Lock()
+			r.l1AlertsCache = cached
+			r.l1AlertsCachedAt = time.Now()
+			r.l1AlertsMu.Unlock()
+			return cached, nil
+		}
+	}
+
+	// 3. Singleflight coalesce concurrent calls during high-load alerts
+	res, err, _ := r.sf.Do("fetch_active_alerts", func() (interface{}, error) {
+		baseURL := r.cfg.RiverServiceURL
+		if baseURL == "" {
+			baseURL = "http://10.1.2.19:8081"
+		}
+		path := fmt.Sprintf("%s/api/v1/internal/alerts/active", baseURL)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := r.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("alerts error %d: %s", resp.StatusCode, string(body))
+		}
+
+		var alerts []domain.GatewayAlertItem
+		if err := json.NewDecoder(resp.Body).Decode(&alerts); err != nil {
+			return nil, err
+		}
+
+		// Update L1
+		r.l1AlertsMu.Lock()
+		r.l1AlertsCache = alerts
+		r.l1AlertsCachedAt = time.Now()
+		r.l1AlertsMu.Unlock()
+
+		// Update L2 Redis Cache asynchronously
+		if r.redisClient != nil {
+			go func(a []domain.GatewayAlertItem) {
+				_ = r.redisClient.SetJSON(context.Background(), redisKeyActiveAlerts, a, redisTTLActiveAlerts)
+			}(alerts)
+		}
+
+		return alerts, nil
+	})
+
 	if err != nil {
+		// Return stale L1 cache if available (Resilience)
+		r.l1AlertsMu.RLock()
+		if r.l1AlertsCache != nil {
+			cached := r.l1AlertsCache
+			r.l1AlertsMu.RUnlock()
+			return cached, nil
+		}
+		r.l1AlertsMu.RUnlock()
 		return nil, err
 	}
 
-	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("alerts error %d: %s", resp.StatusCode, string(body))
-	}
-
-	var alerts []domain.GatewayAlertItem
-	if err := json.NewDecoder(resp.Body).Decode(&alerts); err != nil {
-		return nil, err
-	}
-	return alerts, nil
+	return res.([]domain.GatewayAlertItem), nil
 }
 
 func (r *waterLevelRepository) RelayWebRTCOffer(ctx context.Context, serial, sdpOffer string) (string, error) {
-	go2rtcURL := r.cfg.RiverGo2RTCURL
-	if go2rtcURL == "" {
-		go2rtcURL = "https://cctv.mueangsmart.com"
+	primaryURL := r.cfg.RiverGo2RTCURL
+	if primaryURL == "" {
+		primaryURL = "http://10.1.2.7:1984"
 	}
-	targetURL := fmt.Sprintf("%s/api/webrtc?src=%s", go2rtcURL, url.QueryEscape(serial))
+	publicFallback := "https://cctv.mueangsmart.com"
+
+	targetURL := fmt.Sprintf("%s/api/webrtc?src=%s", primaryURL, url.QueryEscape(serial))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, strings.NewReader(sdpOffer))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/sdp")
-	req.Header.Set("Origin", "https://cctv.mueangsmart.com")
+	req.Header.Set("Origin", primaryURL)
 
 	resp, err := r.httpClient.Do(req)
-	if err != nil {
-		// Fallback to public domain
-		fallbackURL := fmt.Sprintf("https://cctv.mueangsmart.com/api/webrtc?src=%s", url.QueryEscape(serial))
-		req2, err2 := http.NewRequestWithContext(ctx, http.MethodPost, fallbackURL, strings.NewReader(sdpOffer))
-		if err2 != nil {
-			return "", err2
+	if err != nil || (resp != nil && resp.StatusCode != http.StatusOK) {
+		if resp != nil {
+			_ = resp.Body.Close()
 		}
-		req2.Header.Set("Content-Type", "application/sdp")
-		req2.Header.Set("Origin", "https://cctv.mueangsmart.com")
-		resp2, err2 := r.httpClient.Do(req2)
-		if err2 != nil {
-			return "", fmt.Errorf("webrtc offer failed: %v", err2)
+		// Only attempt fallback if primary is distinct from public fallback
+		if !strings.HasPrefix(primaryURL, publicFallback) {
+			fallbackURL := fmt.Sprintf("%s/api/webrtc?src=%s", publicFallback, url.QueryEscape(serial))
+			req2, err2 := http.NewRequestWithContext(ctx, http.MethodPost, fallbackURL, strings.NewReader(sdpOffer))
+			if err2 == nil {
+				req2.Header.Set("Content-Type", "application/sdp")
+				req2.Header.Set("Origin", publicFallback)
+				resp2, err2 := r.httpClient.Do(req2)
+				if err2 == nil {
+					defer resp2.Body.Close()
+					if resp2.StatusCode == http.StatusOK {
+						sdpAnswer, _ := io.ReadAll(resp2.Body)
+						return string(sdpAnswer), nil
+					}
+				}
+			}
 		}
-		defer resp2.Body.Close()
-		sdpAnswer, _ := io.ReadAll(resp2.Body)
-		return string(sdpAnswer), nil
+		if err != nil {
+			return "", fmt.Errorf("webrtc offer failed: %w", err)
+		}
+		return "", fmt.Errorf("webrtc offer failed with status %d", resp.StatusCode)
 	}
 	defer resp.Body.Close()
 

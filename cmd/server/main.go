@@ -86,13 +86,13 @@ func main() {
 	verificationUseCase := usecase.NewVerificationUseCase(verificationRepo)
 	http.NewVerificationHandler(app, verificationUseCase, cfg)
 
-	cctvRepo := repository.NewCCTVRepository(database.DB)
-	cctvUseCase := usecase.NewCCTVUseCase(cctvRepo, authRepo, cfg, redisClient)
-	http.NewCCTVHandler(app, cctvUseCase, cfg, redisClient)
-
 	analyticsRepo := repository.NewAnalyticsRepository(database.DB)
 	analyticsUseCase := usecase.NewAnalyticsUseCase(analyticsRepo)
 	http.NewAnalyticsHandler(app, analyticsUseCase, cfg)
+
+	cctvRepo := repository.NewCCTVRepository(database.DB)
+	cctvUseCase := usecase.NewCCTVUseCase(cctvRepo, authRepo, cfg, redisClient, analyticsUseCase)
+	http.NewCCTVHandler(app, cctvUseCase, cfg, redisClient, authUseCase)
 
 	weatherRepo := repository.NewWeatherRepository(database.DB, cfg, redisClient)
 	weatherUseCase := usecase.NewWeatherUseCase(weatherRepo)
