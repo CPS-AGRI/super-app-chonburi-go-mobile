@@ -47,3 +47,20 @@ func (r *cctvRepository) GetRequestsByUserID(userID uuid.UUID) ([]domain.CCTVReq
 	}
 	return requests, nil
 }
+
+func (r *cctvRepository) CreateViewLog(log *domain.CCTVViewLog) error {
+	return r.db.Create(log).Error
+}
+
+func (r *cctvRepository) FindCameraByIDOrName(idOrName string) (*domain.CCTV, error) {
+	var cam domain.CCTV
+	if parsedUUID, err := uuid.Parse(idOrName); err == nil {
+		if err := r.db.Where("id = ?", parsedUUID).First(&cam).Error; err == nil {
+			return &cam, nil
+		}
+	}
+	if err := r.db.Where("name = ?", idOrName).First(&cam).Error; err == nil {
+		return &cam, nil
+	}
+	return nil, gorm.ErrRecordNotFound
+}

@@ -126,7 +126,72 @@ func NewAuthUseCase(repo domain.AuthRepository, cfg *config.Config, smsClient in
 	}
 }
 
-func (u *authUseCase) LoginWithGoogle(idToken string) (*domain.AuthResponse, error) {
+func exchangeGoogleAuthCode(code string, redirectURI string, clientID string, clientSecret string) (string, error) {
+	data := url.Values{}
+	data.Set("code", code)
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+	if redirectURI != "" {
+		data.Set("redirect_uri", redirectURI)
+	}
+	data.Set("grant_type", "authorization_code")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("failed to create google token request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := oauthHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to call google token endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read google token response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("google token exchange failed (status %d): %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var res struct {
+		IDToken     string `json:"id_token"`
+		AccessToken string `json:"access_token"`
+		Error       string `json:"error"`
+		ErrorDesc   string `json:"error_description"`
+	}
+	if err := json.Unmarshal(bodyBytes, &res); err != nil {
+		return "", fmt.Errorf("failed to parse google token response: %w", err)
+	}
+
+	if res.IDToken == "" {
+		return "", errors.New("no id_token returned from google")
+	}
+
+	return res.IDToken, nil
+}
+
+func (u *authUseCase) LoginWithGoogle(tokenOrCode string, redirectURI ...string) (*domain.AuthResponse, error) {
+	idToken := tokenOrCode
+	// If input is an authorization code (not a JWT starting with "ey" containing at least 2 dots), exchange it on server
+	if !strings.HasPrefix(tokenOrCode, "ey") || strings.Count(tokenOrCode, ".") < 2 {
+		var rURI string
+		if len(redirectURI) > 0 {
+			rURI = redirectURI[0]
+		}
+		exchangedToken, err := exchangeGoogleAuthCode(tokenOrCode, rURI, u.config.GoogleClientID, u.config.GoogleClientSecret)
+		if err != nil {
+			return nil, err
+		}
+		idToken = exchangedToken
+	}
+
 	googleID, email, name, picture, rawDataStr, err := verifyGoogleIDToken(idToken, u.config.GoogleClientID)
 	if err != nil {
 		return nil, err
@@ -2168,7 +2233,31 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 	pidHash := hmacSHA256(pid, u.config.PIDHmacSecret)
 	if existing, err := u.repo.GetByProviderID("thaiid", pidHash); err == nil {
 		if existing.ID.String() != userID {
-			return nil, errors.New("ThaiID นี้ถูกผูกกับบัญชีอื่นอยู่แล้ว")
+			// สร้าง Migration Token เก็บไว้ใน Redis เพื่อรอการยืนยันย้ายบัญชีจากผู้ใช้ (TTL 5 นาที)
+			migrationToken := uuid.New().String()
+			migrationData := map[string]interface{}{
+				"old_user_id":  existing.ID.String(),
+				"new_user_id":  userID,
+				"pid":          pid,
+				"dopa_profile": dopaProfile,
+				"created_at":   time.Now().Unix(),
+			}
+
+			if u.redisClient != nil {
+				_ = u.redisClient.SetJSON(context.Background(), "thaiid:migration:"+migrationToken, migrationData, 5*time.Minute)
+			}
+
+			existingPhone := existing.PhoneNumber
+			if existingPhone == "" && existing.Information != nil {
+				existingPhone = existing.Information.Phone
+			}
+
+			return nil, &domain.ThaiIDConflictError{
+				Conflict:            true,
+				ErrorMsg:            "ThaiID นี้ถูกผูกกับบัญชีอื่นอยู่แล้ว",
+				MigrationToken:      migrationToken,
+				ExistingMaskedPhone: maskPhoneNumber(existingPhone),
+			}
 		}
 		// ผูกอยู่แล้วกับบัญชีนี้ — คืน token ปัจจุบันได้เลย
 		accessToken, _ := u.generateAccessToken(existing)
@@ -2559,5 +2648,186 @@ func (u *authUseCase) syncProfileFromSocial(userID uuid.UUID, account *domain.Us
 
 func (u *authUseCase) UpdateProfileImage(userID uuid.UUID, imageURL string) error {
 	return u.repo.UpdateProfileImage(userID, imageURL)
+}
+
+func (u *authUseCase) ConfirmThaiIDMigration(userID, migrationToken string) (*domain.AuthResponse, error) {
+	if migrationToken == "" {
+		return nil, errors.New("migration_token is required")
+	}
+	if userID == "" {
+		return nil, errors.New("user_id is required")
+	}
+
+	newParsedID, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid user_id format: %w", err)
+	}
+
+	var migrationData struct {
+		OldUserID   string                 `json:"old_user_id"`
+		NewUserID   string                 `json:"new_user_id"`
+		PID         string                 `json:"pid"`
+		DOPAProfile map[string]interface{} `json:"dopa_profile"`
+	}
+
+	if u.redisClient == nil {
+		return nil, errors.New("redis service unavailable for migration verification")
+	}
+
+	redisKey := "thaiid:migration:" + migrationToken
+	if err := u.redisClient.GetJSON(context.Background(), redisKey, &migrationData); err != nil || migrationData.PID == "" {
+		return nil, errors.New("การยืนยันย้ายบัญชีหมดอายุหรือไม่ถูกต้อง กรุณากดผูก ThaiID ใหม่อีกครั้ง")
+	}
+
+	if migrationData.NewUserID != userID {
+		return nil, errors.New("user_id mismatch with migration session")
+	}
+
+	oldParsedID, err := uuid.Parse(migrationData.OldUserID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid old_user_id in migration session: %w", err)
+	}
+
+	pid := migrationData.PID
+	dopaProfile := migrationData.DOPAProfile
+	pidHash := hmacSHA256(pid, u.config.PIDHmacSecret)
+
+	// Safe profile for raw JSON
+	safeProfile := make(map[string]interface{})
+	for k, v := range dopaProfile {
+		if k == "pid" || k == "access_token" || k == "refresh_token" {
+			continue
+		}
+		safeProfile[k] = v
+	}
+	rawBytes, _ := json.Marshal(safeProfile)
+
+	oauthAcc := &domain.UserOauthAccount{
+		ID:         uuid.New(),
+		UserId:     newParsedID,
+		Provider:   "thaiid",
+		ProviderId: pidHash,
+		DisplayName: func() string {
+			if n, ok := dopaProfile["name"].(string); ok && n != "" {
+				return n
+			}
+			given, _ := dopaProfile["given_name"].(string)
+			family, _ := dopaProfile["family_name"].(string)
+			return given + " " + family
+		}(),
+		RawData:   string(rawBytes),
+		CreatedAt: time.Now(),
+	}
+
+	now := time.Now()
+	idCardTypeVal := 1
+	var encryptedPID string
+	if enc, err := encryptAES256GCM(pid, u.config.PIDEncryptionKey); err == nil {
+		encryptedPID = enc
+	} else {
+		encryptedPID = "ENC_" + pid
+	}
+
+	updateInfo := &domain.UserInformation{
+		UserId:                  newParsedID,
+		VerificationStatus:      "verified",
+		VerifiedDate:            &now,
+		IdentityNumberHash:      pidHash,
+		IdentityNumberEncrypted: encryptedPID,
+		IdCardType:              &idCardTypeVal,
+	}
+
+	givenName, _ := dopaProfile["given_name"].(string)
+	familyName, _ := dopaProfile["family_name"].(string)
+	if givenName != "" {
+		updateInfo.Name = givenName
+	}
+	if familyName != "" {
+		updateInfo.LastName = familyName
+	} else if isPlaceholderLastName(updateInfo.LastName) {
+		updateInfo.LastName = ""
+	}
+
+	title, _ := dopaProfile["titleTh"].(string)
+	if title == "" {
+		title, _ = dopaProfile["title"].(string)
+	}
+	if title != "" {
+		updateInfo.Prefix = title
+	}
+
+	if birthdateStr, ok := dopaProfile["birthdate"].(string); ok && birthdateStr != "" {
+		if t, err := time.Parse("2006-01-02", birthdateStr); err == nil {
+			updateInfo.Birthday = &t
+		}
+	}
+
+	if expiryStr, ok := dopaProfile["date_of_expiry"].(string); ok && expiryStr != "" {
+		if t, err := time.Parse("2006-01-02", expiryStr); err == nil {
+			updateInfo.IdCardExpiry = &t
+		}
+	}
+
+	hNo, vNo, alley, road, subdist, dist, prov, pCode := parseThaiIDAddress(dopaProfile)
+	if hNo != "" {
+		updateInfo.HouseNumber = hNo
+	}
+	if vNo != "" {
+		updateInfo.VillageNumber = vNo
+	}
+	if alley != "" {
+		updateInfo.Alley = alley
+	}
+	if road != "" {
+		updateInfo.Road = road
+	}
+	if subdist != "" {
+		updateInfo.Subdistrict = subdist
+	}
+	if dist != "" {
+		updateInfo.District = dist
+	}
+	if prov != "" {
+		updateInfo.Province = prov
+	}
+	if pCode > 0 {
+		updateInfo.PostalCode = pCode
+	}
+
+	if err := u.repo.MigrateThaiIDAccount(oldParsedID, newParsedID, oauthAcc, updateInfo); err != nil {
+		return nil, fmt.Errorf("failed to migrate thaiid account: %w", err)
+	}
+
+	_ = u.redisClient.Delete(context.Background(), redisKey)
+
+	freshUser, err := u.repo.GetByID(newParsedID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch updated user: %w", err)
+	}
+
+	accessToken, err := u.generateAccessToken(freshUser)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate access token: %w", err)
+	}
+	refreshToken, err := u.generateRefreshToken(freshUser)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate refresh token: %w", err)
+	}
+
+	return &domain.AuthResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		User:         freshUser,
+	}, nil
+}
+
+func maskPhoneNumber(phone string) string {
+	if len(phone) < 7 {
+		return phone
+	}
+	if len(phone) == 10 {
+		return phone[:3] + "-xxx-" + phone[6:]
+	}
+	return phone[:2] + "xxx" + phone[len(phone)-3:]
 }
 

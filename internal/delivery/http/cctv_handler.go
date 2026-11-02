@@ -70,6 +70,12 @@ func NewCCTVHandler(
 	app.Get("/login/cctv/thaid", handler.RenderThaIDLoginPage)       // Alias
 	app.Get("/sso/callback", handler.HandleThaIDCallback)            // Callback handler after ThaID approval
 	app.Get("/sso/simulate-callback", handler.SimulateThaIDCallback) // Dev / UAT Bypass Simulator
+
+	// 4. Mobile CCTV Telemetry (Optional Auth - Citizen / Guest)
+	app.Post("/api/v1/mobile/cctv/logs", handler.CreateViewLog)
+	app.Post("/mobile/cctv/logs", handler.CreateViewLog)
+	app.Post("/api/v1/cctv/logs", handler.CreateViewLog)
+	app.Post("/cctv/logs", handler.CreateViewLog)
 }
 
 func (h *cctvHandler) checkRateLimit(key string, maxRequests int, window time.Duration) bool {
@@ -546,4 +552,50 @@ func (h *cctvHandler) GetMyRequests(c fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"success": true, "data": requests})
+}
+
+// CreateViewLog handles citizen mobile camera view session telemetry.
+// Allows both authenticated users (extracts userID from JWT) and guest users.
+func (h *cctvHandler) CreateViewLog(c fiber.Ctx) error {
+	var input domain.CreateCCTVLogInput
+	if err := c.Bind().JSON(&input); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "invalid request body",
+		})
+	}
+
+	if input.CCTVID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error":   "cctv_id is required",
+		})
+	}
+
+	// Try extracting user_id if token provided (optional authentication)
+	var userUUID *uuid.UUID
+	authHeader := c.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") && h.cfg != nil {
+		tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+		if claims, err := jwtutil.ParseMobileToken(tokenStr, h.cfg.JWTSecret); err == nil && claims.UserID != "" {
+			if parsed, pErr := uuid.Parse(claims.UserID); pErr == nil {
+				userUUID = &parsed
+			}
+		}
+	}
+
+	clientIP := c.IP()
+	userAgent := c.Get("User-Agent")
+
+	if err := h.useCase.RecordViewLog(input, userUUID, clientIP, userAgent); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   err.Error(),
+		})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"success": true,
+		"message": "view log recorded successfully",
+	})
 }

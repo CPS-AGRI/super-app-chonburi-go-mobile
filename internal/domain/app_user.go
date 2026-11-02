@@ -149,6 +149,18 @@ type AuthRepository interface {
 	UpdateProfileImage(userID uuid.UUID, imageURL string) error
 	GetExistingSocialProfile(userID uuid.UUID, provider string) (*UserOauthAccount, error)
 	BindOverrideSocialAccount(userID uuid.UUID, provider string, newOAuthID uuid.UUID) error
+	MigrateThaiIDAccount(oldUserID, newUserID uuid.UUID, oauthAcc *UserOauthAccount, updateInfo *UserInformation) error
+}
+
+type ThaiIDConflictError struct {
+	Conflict            bool   `json:"conflict"`
+	ErrorMsg            string `json:"error"`
+	MigrationToken      string `json:"migration_token"`
+	ExistingMaskedPhone string `json:"existing_masked_phone"`
+}
+
+func (e *ThaiIDConflictError) Error() string {
+	return e.ErrorMsg
 }
 
 type SocialConflictError struct {
@@ -229,12 +241,13 @@ type PinLoginRequest struct {
 }
 
 type AuthUseCase interface {
-	LoginWithGoogle(idToken string) (*AuthResponse, error)
+	LoginWithGoogle(tokenOrCode string, redirectURI ...string) (*AuthResponse, error)
 	LoginWithFacebook(accessToken string) (*AuthResponse, error)
 	LoginWithFacebookLimited(authToken string) (*AuthResponse, error)
 	LoginWithLine(code string, redirectURI string) (*AuthResponse, error)
 	LoginWithThaiID(code string, redirectURI string) (*AuthResponse, error)
 	BindThaiID(userID string, code string, redirectURI string) (*AuthResponse, error)
+	ConfirmThaiIDMigration(userID string, migrationToken string) (*AuthResponse, error)
 	RefreshToken(refreshToken string) (*AuthResponse, error)
 	RequestOTP(phoneNumber string) (*OTPRequestResponse, error)
 	VerifyOTP(phoneNumber, otp, ref string) (*OTPVerifyResponse, error)

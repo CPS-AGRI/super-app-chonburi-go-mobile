@@ -118,6 +118,11 @@ func (m *MockAuthRepository) BindOverrideSocialAccount(userID uuid.UUID, provide
 	return args.Error(0)
 }
 
+func (m *MockAuthRepository) MigrateThaiIDAccount(oldUserID, newUserID uuid.UUID, oauthAcc *domain.UserOauthAccount, updateInfo *domain.UserInformation) error {
+	args := m.Called(oldUserID, newUserID, oauthAcc, updateInfo)
+	return args.Error(0)
+}
+
 // MockSMSService implements infrastructure.SMSService for testing
 type MockSMSService struct {
 	mock.Mock

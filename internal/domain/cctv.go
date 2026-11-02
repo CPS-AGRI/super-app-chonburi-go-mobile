@@ -66,11 +66,42 @@ type MobileCCTVQuery struct {
 	LngMax float64 `json:"lng_max"`
 }
 
+// CCTVViewLog represents telemetry audit trail for citizen or staff camera view sessions.
+type CCTVViewLog struct {
+	ID              uuid.UUID  `gorm:"type:uuid;primaryKey;default:uuid_generate_v4()" json:"id"`
+	CCTVID          uuid.UUID  `gorm:"type:uuid;not null;index" json:"cctv_id"`
+	UserID          *uuid.UUID `gorm:"type:uuid;index" json:"user_id"`
+	PolicyType      string     `gorm:"type:varchar(50);default:'UserPolicy'" json:"policy_type"`
+	DeviceType      string     `gorm:"type:varchar(50);default:'Mobile App'" json:"device_type"`
+	StartedAt       time.Time  `gorm:"not null" json:"started_at"`
+	EndedAt         *time.Time `json:"ended_at"`
+	DurationSeconds int        `gorm:"default:0" json:"duration_seconds"`
+	IPAddress       string     `gorm:"type:varchar(50)" json:"ip_address"`
+	UserAgent       string     `gorm:"type:varchar(255)" json:"user_agent"`
+	CreatedAt       time.Time  `gorm:"default:CURRENT_TIMESTAMP" json:"created_at"`
+}
+
+func (CCTVViewLog) TableName() string {
+	return "module_cctv_view_logs"
+}
+
+// CreateCCTVLogInput contains input for logging a camera view telemetry session.
+type CreateCCTVLogInput struct {
+	CCTVID          string     `json:"cctv_id"`
+	StartedAt       time.Time  `json:"started_at"`
+	EndedAt         *time.Time `json:"ended_at"`
+	DurationSeconds int        `json:"duration_seconds"`
+	DeviceType      string     `json:"device_type"`
+	PolicyType      string     `json:"policy_type"`
+}
+
 // MobileCCTVRepository defines the data layer interface for Mobile CCTV API.
 type MobileCCTVRepository interface {
 	GetCameras(query MobileCCTVQuery) ([]CCTV, error)
 	CreateRequest(req *CCTVRequest) error
 	GetRequestsByUserID(userID uuid.UUID) ([]CCTVRequest, error)
+	CreateViewLog(log *CCTVViewLog) error
+	FindCameraByIDOrName(idOrName string) (*CCTV, error)
 }
 
 // MobileCCTVUseCase defines the business layer interface for Mobile CCTV API.
@@ -78,6 +109,7 @@ type MobileCCTVUseCase interface {
 	GetCameras(query MobileCCTVQuery) ([]CCTV, error)
 	CreateRequest(req *CCTVRequest) error
 	GetMyRequests(userID uuid.UUID) ([]CCTVRequest, error)
+	RecordViewLog(input CreateCCTVLogInput, userID *uuid.UUID, clientIP, userAgent string) error
 
 	// Unified Ticket Handshake System (Channel 1 & Channel 2)
 	CreateHandshakeTicket(userID uuid.UUID, input CreateHandshakeTicketInput, meta ...RequestMetadata) (*CreateHandshakeTicketResponse, error)

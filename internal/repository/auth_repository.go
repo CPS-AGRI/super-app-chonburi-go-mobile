@@ -308,3 +308,53 @@ func (r *authRepository) BindOverrideSocialAccount(userID uuid.UUID, provider st
 	})
 }
 
+func (r *authRepository) MigrateThaiIDAccount(oldUserID, newUserID uuid.UUID, oauthAcc *domain.UserOauthAccount, updateInfo *domain.UserInformation) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		// 1. Delete ThaiID oauth account from old user
+		if err := tx.Where("user_id = ? AND LOWER(provider) = 'thaiid'", oldUserID).Delete(&domain.UserOauthAccount{}).Error; err != nil {
+			return fmt.Errorf("failed to unlink thaiid from old user: %w", err)
+		}
+
+		// 2. Demote old user's verification status
+		if err := tx.Model(&domain.UserInformation{}).Where("user_id = ?", oldUserID).Updates(map[string]interface{}{
+			"verification_status":       "unverified",
+			"identity_number_hash":      "",
+			"identity_number_encrypted": "",
+		}).Error; err != nil {
+			return fmt.Errorf("failed to reset old user verification: %w", err)
+		}
+
+		// 3. Delete any existing ThaiID oauth record for new user (prevent duplicate)
+		if err := tx.Where("user_id = ? AND LOWER(provider) = 'thaiid'", newUserID).Delete(&domain.UserOauthAccount{}).Error; err != nil {
+			return fmt.Errorf("failed to clean existing thaiid for new user: %w", err)
+		}
+
+		// 4. Create new ThaiID oauth account for new user
+		oauthAcc.UserId = newUserID
+		if oauthAcc.ID == uuid.Nil {
+			oauthAcc.ID = uuid.New()
+		}
+		if err := tx.Create(oauthAcc).Error; err != nil {
+			return fmt.Errorf("failed to create thaiid oauth account for new user: %w", err)
+		}
+
+		// 5. Update new user's information with DOPA verified data
+		if updateInfo != nil {
+			updateInfo.UserId = newUserID
+			var count int64
+			tx.Model(&domain.UserInformation{}).Where("user_id = ?", newUserID).Count(&count)
+			if count > 0 {
+				if err := tx.Model(&domain.UserInformation{}).Where("user_id = ?", newUserID).Updates(updateInfo).Error; err != nil {
+					return fmt.Errorf("failed to update new user information: %w", err)
+				}
+			} else {
+				if err := tx.Create(updateInfo).Error; err != nil {
+					return fmt.Errorf("failed to create new user information: %w", err)
+				}
+			}
+		}
+
+		return nil
+	})
+}
+

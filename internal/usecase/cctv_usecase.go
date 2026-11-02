@@ -549,3 +549,64 @@ func (u *cctvUseCase) CreateWebHandshakeTicket(userID uuid.UUID, callbackURL, pa
 	}
 	return fmt.Sprintf("%s%sticket=%s", callbackURL, separator, ticketID), nil
 }
+
+func (u *cctvUseCase) RecordViewLog(input domain.CreateCCTVLogInput, userID *uuid.UUID, clientIP, userAgent string) error {
+	if input.DurationSeconds < 3 {
+		return nil // Ignore noise (< 3s)
+	}
+
+	var cctvUUID uuid.UUID
+	var err error
+	if input.CCTVID != "" {
+		cctvUUID, err = uuid.Parse(input.CCTVID)
+	}
+
+	if err != nil || cctvUUID == uuid.Nil {
+		if cam, findErr := u.repo.FindCameraByIDOrName(input.CCTVID); findErr == nil && cam != nil {
+			cctvUUID = cam.ID
+		}
+	}
+
+	if cctvUUID == uuid.Nil {
+		return errors.New("cctv device not found")
+	}
+
+	now := time.Now()
+	if input.StartedAt.IsZero() {
+		input.StartedAt = now.Add(-time.Duration(input.DurationSeconds) * time.Second)
+	}
+	if input.EndedAt == nil {
+		end := now
+		input.EndedAt = &end
+	}
+
+	if input.DurationSeconds > 28800 {
+		input.DurationSeconds = 28800
+	}
+
+	device := input.DeviceType
+	if device == "" {
+		device = "Mobile App"
+	}
+
+	policyType := input.PolicyType
+	if policyType == "" {
+		policyType = "UserPolicy"
+	}
+
+	viewLog := &domain.CCTVViewLog{
+		ID:              uuid.New(),
+		CCTVID:          cctvUUID,
+		UserID:          userID,
+		PolicyType:      policyType,
+		DeviceType:      device,
+		StartedAt:       input.StartedAt,
+		EndedAt:         input.EndedAt,
+		DurationSeconds: input.DurationSeconds,
+		IPAddress:       clientIP,
+		UserAgent:       userAgent,
+		CreatedAt:       time.Now(),
+	}
+
+	return u.repo.CreateViewLog(viewLog)
+}

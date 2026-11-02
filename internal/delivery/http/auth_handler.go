@@ -35,6 +35,7 @@ func NewAuthHandler(app *fiber.App, usecase domain.AuthUseCase, cfg *config.Conf
 	group.Post("/thaiid", handler.LoginWithThaiID)
 	group.Get("/thaiid/callback", handler.ThaiIDCallback)
 	group.Post("/thaiid/bind", handler.BindThaiID)
+	group.Post("/thaiid/bind/confirm", handler.ConfirmThaiIDMigration)
 	group.Post("/refresh", handler.RefreshToken)
 	group.Post("/otp/request", handler.RequestOTP)
 	group.Post("/otp/verify", handler.VerifyOTP)
@@ -53,17 +54,24 @@ func NewAuthHandler(app *fiber.App, usecase domain.AuthUseCase, cfg *config.Conf
 
 func (h *AuthHandler) LoginWithGoogle(c fiber.Ctx) error {
 	var req struct {
-		IDToken string `json:"id_token"`
+		IDToken     string `json:"id_token"`
+		Code        string `json:"code"`
+		RedirectURI string `json:"redirect_uri"`
 	}
 	if err := c.Bind().Body(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	if req.IDToken == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "id_token is required"})
+	tokenOrCode := strings.TrimSpace(req.IDToken)
+	if tokenOrCode == "" {
+		tokenOrCode = strings.TrimSpace(req.Code)
 	}
 
-	res, err := h.usecase.LoginWithGoogle(req.IDToken)
+	if tokenOrCode == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "id_token or code is required"})
+	}
+
+	res, err := h.usecase.LoginWithGoogle(tokenOrCode, req.RedirectURI)
 	if err != nil {
 		return c.Status(401).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -177,6 +185,42 @@ func (h *AuthHandler) BindThaiID(c fiber.Ctx) error {
 	}
 
 	res, err := h.usecase.BindThaiID(req.UserID, req.Code, req.RedirectURI)
+	if err != nil {
+		if conflictErr, ok := err.(*domain.ThaiIDConflictError); ok {
+			return c.Status(409).JSON(fiber.Map{
+				"conflict":              true,
+				"error":                 conflictErr.ErrorMsg,
+				"migration_token":       conflictErr.MigrationToken,
+				"existing_masked_phone": conflictErr.ExistingMaskedPhone,
+			})
+		}
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(res)
+}
+
+func (h *AuthHandler) ConfirmThaiIDMigration(c fiber.Ctx) error {
+	var req struct {
+		UserID         string `json:"user_id"`
+		MigrationToken string `json:"migration_token"`
+	}
+	if err := c.Bind().Body(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	if req.UserID == "" {
+		auth := c.Get("Authorization")
+		if strings.HasPrefix(auth, "Bearer ") {
+			req.UserID = c.Get("X-User-ID")
+		}
+	}
+
+	if req.UserID == "" || req.MigrationToken == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "user_id and migration_token are required"})
+	}
+
+	res, err := h.usecase.ConfirmThaiIDMigration(req.UserID, req.MigrationToken)
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 	}
