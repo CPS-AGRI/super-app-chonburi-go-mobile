@@ -6,6 +6,101 @@ import (
 	"github.com/google/uuid"
 )
 
+// ============================================================
+// User Weather Subscription
+// Written by: super-app-chonburi-go-mobile (Mobile API)
+// Read by:    super-app-chonburi-go (Alert Evaluation Cron)
+// ============================================================
+
+// UserWeatherSubscription represents a user's weather alert area of interest.
+type UserWeatherSubscription struct {
+	ID          uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"id"`
+	UserID      uuid.UUID `gorm:"type:uuid;not null"                             json:"user_id"`
+	District    string    `gorm:"type:text;not null"                             json:"district"`
+	Subdistrict string    `gorm:"type:text;not null"                             json:"subdistrict"`
+	IsPrimary   bool      `gorm:"type:boolean;not null;default:false"            json:"is_primary"`
+	IsActive    bool      `gorm:"type:boolean;not null;default:true"             json:"is_active"`
+	CreatedAt   time.Time `gorm:"type:timestamptz;not null;default:now()"        json:"created_at"`
+	UpdatedAt   time.Time `gorm:"type:timestamptz;not null;default:now()"        json:"updated_at"`
+}
+
+func (UserWeatherSubscription) TableName() string {
+	return "user_weather_subscriptions"
+}
+
+// WeatherAlertHistory represents an issued weather alert entry
+type WeatherAlertHistory struct {
+	ID          uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"id"`
+	Subdistrict string    `gorm:"type:varchar(100);not null" json:"subdistrict"`
+	District    string    `gorm:"type:varchar(100);not null" json:"district"`
+	Title       string    `gorm:"type:varchar(255);not null" json:"title"`
+	Message     string    `gorm:"type:text;not null" json:"message"`
+	Severity    string    `gorm:"type:varchar(20);not null;default:'info'" json:"severity"`
+	AlertType   string    `gorm:"type:varchar(50);not null;default:'general'" json:"alert_type"`
+	ImageURL    string    `gorm:"type:text" json:"image_url"`
+	SentCount   int       `gorm:"type:int;not null;default:0" json:"sent_count"`
+	CreatedAt   time.Time `gorm:"type:timestamptz;not null;default:now()" json:"created_at"`
+}
+
+func (WeatherAlertHistory) TableName() string {
+	return "weather_alert_history"
+}
+
+// WeatherAlertFeedResponse is the DTO formatted specifically for Mobile App notification cards
+type WeatherAlertFeedResponse struct {
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Message   string `json:"message"`
+	Timestamp string `json:"timestamp"`
+	Type      string `json:"type"`  // "rain" | "pm25" | "storm" | "general"
+	Level     string `json:"level"` // "info" | "warning" | "danger"
+	ImageURL  string `json:"image_url,omitempty"`
+}
+
+// WeatherSubscriptionRequest is the Mobile API request payload.
+type WeatherSubscriptionRequest struct {
+	District    string `json:"district"    validate:"required"`
+	Subdistrict string `json:"subdistrict" validate:"required"`
+}
+
+// WeatherSubscriptionResponse is the Mobile API response for a single subscription.
+type WeatherSubscriptionResponse struct {
+	ID          uuid.UUID `json:"id"`
+	District    string    `json:"district"`
+	Subdistrict string    `json:"subdistrict"`
+	IsPrimary   bool      `json:"is_primary"`
+	IsActive    bool      `json:"is_active"`
+}
+
+// ChonburiLocationItem represents a selectable area for the mobile UI picker.
+type ChonburiLocationItem struct {
+	District     string   `json:"district"`
+	Subdistricts []string `json:"subdistricts"`
+}
+
+// WeatherSubscriptionRepository defines persistence operations.
+type WeatherSubscriptionRepository interface {
+	GetByUserID(userID uuid.UUID) ([]UserWeatherSubscription, error)
+	CountByUserID(userID uuid.UUID) (int64, error)
+	UpsertPrimary(userID uuid.UUID, district, subdistrict string) error
+	Create(sub *UserWeatherSubscription) error
+	Delete(id uuid.UUID, userID uuid.UUID) error
+	GetAlertHistory(subdistricts []string, limit int) ([]WeatherAlertHistory, error)
+}
+
+// WeatherSubscriptionUseCase defines business logic for subscription management.
+type WeatherSubscriptionUseCase interface {
+	GetSubscriptions(userID uuid.UUID) ([]WeatherSubscriptionResponse, error)
+	AddSubscription(userID uuid.UUID, req *WeatherSubscriptionRequest) error
+	RemoveSubscription(id uuid.UUID, userID uuid.UUID) error
+	SyncPrimaryFromAddress(userID uuid.UUID, district, subdistrict string) error
+	GetAlertHistory(userID uuid.UUID, limit int) ([]WeatherAlertFeedResponse, error)
+}
+
+// ============================================================
+// Weather Account (existing)
+// ============================================================
+
 // WeatherAccount represents an account registered in Chonburi database
 type WeatherAccount struct {
 	ID             uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
@@ -22,7 +117,9 @@ func (WeatherAccount) TableName() string {
 	return "chonburi_weather_accounts"
 }
 
+// ============================================================
 // Raw models returned from ff-weather-service (10.1.2.25:50059)
+// ============================================================
 
 type FahfonStationItem struct {
 	IMEI         string             `json:"imei"`
@@ -57,10 +154,10 @@ type FahfonParameters struct {
 }
 
 type FahfonPosition struct {
-	Height       string  `json:"height"`
-	Latitude     string  `json:"latitude"`
-	Longitude    string  `json:"longitude"`
-	TimeStampUTC int64   `json:"timeStampUTC"`
+	Height       string `json:"height"`
+	Latitude     string `json:"latitude"`
+	Longitude    string `json:"longitude"`
+	TimeStampUTC int64  `json:"timeStampUTC"`
 }
 
 type FahfonRegistedIMEI struct {
@@ -80,7 +177,9 @@ type FahfonStationsResponse struct {
 	TotalItems int                 `json:"total_items,omitempty"`
 }
 
+// ============================================================
 // Clean Mobile Response Model
+// ============================================================
 
 type WeatherStationDTO struct {
 	ID              string  `json:"id"`

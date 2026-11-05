@@ -12,11 +12,16 @@ import (
 )
 
 type verificationUseCase struct {
-	repo domain.VerificationRepository
+	repo    domain.VerificationRepository
+	subsSvc domain.WeatherSubscriptionUseCase // optional: auto-sync weather subscription on address update
 }
 
-func NewVerificationUseCase(repo domain.VerificationRepository) domain.VerificationUseCase {
-	return &verificationUseCase{repo: repo}
+func NewVerificationUseCase(repo domain.VerificationRepository, subsSvc ...domain.WeatherSubscriptionUseCase) domain.VerificationUseCase {
+	uc := &verificationUseCase{repo: repo}
+	if len(subsSvc) > 0 {
+		uc.subsSvc = subsSvc[0]
+	}
+	return uc
 }
 
 func formatThaiAddress(info *domain.UserInformation) string {
@@ -190,7 +195,19 @@ func (u *verificationUseCase) GetVerificationStatus(userID uuid.UUID) (*domain.V
 }
 
 func (u *verificationUseCase) UpdateAddress(userID uuid.UUID, req *domain.UpdateAddressRequest) error {
-	return u.repo.UpdateAddress(userID, req)
+	if err := u.repo.UpdateAddress(userID, req); err != nil {
+		return err
+	}
+	// Auto-sync primary weather subscription to match the new home address (fire-and-forget)
+	if u.subsSvc != nil && req.Subdistrict != "" && req.District != "" {
+		go func() {
+			if err := u.subsSvc.SyncPrimaryFromAddress(userID, req.District, req.Subdistrict); err != nil {
+				// Non-critical: log but do not fail the address update
+				_ = err
+			}
+		}()
+	}
+	return nil
 }
 
 func (u *verificationUseCase) RegisterFCMToken(userID uuid.UUID, req *domain.RegisterFCMTokenRequest) error {

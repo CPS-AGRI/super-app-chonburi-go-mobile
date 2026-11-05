@@ -82,8 +82,13 @@ func main() {
 	notificationUseCase := usecase.NewNotificationUseCase(notificationRepo)
 	http.NewNotificationHandler(app, notificationUseCase, cfg)
 
+	// Weather Subscriptions (Area alert preferences)
+	weatherSubRepo := repository.NewWeatherSubscriptionRepository(database.DB)
+	weatherSubUseCase := usecase.NewWeatherSubscriptionUseCase(weatherSubRepo)
+	http.RegisterWeatherSubscriptionRoutes(app, cfg, weatherSubUseCase)
+
 	verificationRepo := repository.NewVerificationRepository(database.DB)
-	verificationUseCase := usecase.NewVerificationUseCase(verificationRepo)
+	verificationUseCase := usecase.NewVerificationUseCase(verificationRepo, weatherSubUseCase)
 	http.NewVerificationHandler(app, verificationUseCase, cfg)
 
 	analyticsRepo := repository.NewAnalyticsRepository(database.DB)

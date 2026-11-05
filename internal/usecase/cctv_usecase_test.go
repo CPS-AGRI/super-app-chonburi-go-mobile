@@ -33,6 +33,19 @@ func (m *MockMobileCCTVRepository) GetRequestsByUserID(userID uuid.UUID) ([]doma
 	return args.Get(0).([]domain.CCTVRequest), args.Error(1)
 }
 
+func (m *MockMobileCCTVRepository) CreateViewLog(log *domain.CCTVViewLog) error {
+	args := m.Called(log)
+	return args.Error(0)
+}
+
+func (m *MockMobileCCTVRepository) FindCameraByIDOrName(idOrName string) (*domain.CCTV, error) {
+	args := m.Called(idOrName)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*domain.CCTV), args.Error(1)
+}
+
 func TestCCTVUseCase_CreateHandshakeTicket_ThaIDGatekeeper(t *testing.T) {
 	mockCCTVRepo := new(MockMobileCCTVRepository)
 	mockAuthRepo := new(MockAuthRepository)
