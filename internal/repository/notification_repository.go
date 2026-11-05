@@ -32,17 +32,22 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 		ReferenceID    string
 		IsPR           bool
 		IsComplaint    bool
+		ImageURL       string
+		Severity       string
 	}
 	var txItems []txRow
 	err := r.db.Raw(`
 		SELECT n.id, n.reference_title, n.reference_body, n.created_date, n.updated_date, COALESCE(m.name_th, '') as module_name,
 		       (un.module_notification_id IS NOT NULL) as read, n.reference_id,
 		       (pr.id IS NOT NULL) as is_pr,
-		       (mc.id IS NOT NULL) as is_complaint
+		       (mc.id IS NOT NULL) as is_complaint,
+		       COALESCE(wah.image_url, '') as image_url,
+		       COALESCE(wah.severity, n.reference_status, 'info') as severity
 		FROM module_notifications n
 		LEFT JOIN modules m ON m.id = n.module_id
 		LEFT JOIN module_public_relations pr ON pr.id::text = n.reference_id
 		LEFT JOIN module_complaints mc ON mc.id::text = n.reference_id
+		LEFT JOIN weather_alert_history wah ON wah.id::text = n.reference_id
 		LEFT JOIN module_user_notifications un ON un.module_notification_id = n.id AND un.user_id = ?
 		WHERE (n.user_id = ? OR (n.user_id IS NULL AND n.type = 'user'))
 	`, userID, userID).Scan(&txItems).Error
@@ -109,6 +114,8 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 			Read:        item.Read,
 			ReferenceID: item.ReferenceID,
 			Source:      "general",
+			ImageURL:    item.ImageURL,
+			Severity:    item.Severity,
 		})
 	}
 

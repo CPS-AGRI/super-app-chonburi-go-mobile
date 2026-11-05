@@ -56,6 +56,8 @@ type NotificationResponseItem struct {
 	Read        bool   `json:"read"`
 	ReferenceID string `json:"reference_id,omitempty"`
 	Source      string `json:"source,omitempty"`
+	ImageURL    string `json:"image_url,omitempty"`
+	Severity    string `json:"severity,omitempty"`
 }
 
 type NotificationRepository interface {
