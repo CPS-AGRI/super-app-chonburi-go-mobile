@@ -49,7 +49,7 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 		LEFT JOIN module_complaints mc ON mc.id::text = n.reference_id
 		LEFT JOIN weather_alert_history wah ON wah.id::text = n.reference_id
 		LEFT JOIN module_user_notifications un ON un.module_notification_id = n.id AND un.user_id = ?
-		WHERE (n.user_id = ? OR (n.user_id IS NULL AND n.type = 'user'))
+		WHERE (n.user_id = ? OR (n.user_id IS NULL AND n.type = 'user' AND (n.module_id IS NULL OR n.module_id != '10e5e192-8254-479b-ab83-86bfd09504eb')))
 	`, userID, userID).Scan(&txItems).Error
 	if err != nil {
 		return nil, err
@@ -163,7 +163,7 @@ func (r *notificationRepository) MarkAllAsRead(userID uuid.UUID) error {
 	return r.db.Exec(`
 		INSERT INTO module_user_notifications (module_notification_id, user_id, created_date)
 		SELECT id, ?, NOW() FROM (
-			SELECT id FROM module_notifications WHERE (user_id = ? OR (user_id IS NULL AND type = 'user'))
+			SELECT id FROM module_notifications WHERE (user_id = ? OR (user_id IS NULL AND type = 'user' AND (module_id IS NULL OR module_id != '10e5e192-8254-479b-ab83-86bfd09504eb')))
 			UNION
 			SELECT id FROM module_public_relation_notifications WHERE status = 'active' AND (send_date IS NULL OR send_date <= NOW())
 		) AS all_notifs
