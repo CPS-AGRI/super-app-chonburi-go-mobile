@@ -13,8 +13,9 @@ import (
 )
 
 type MobileClaims struct {
-	UserID string `json:"user_id"`
-	Email  string `json:"email"`
+	UserID    string `json:"user_id"`
+	Email     string `json:"email"`
+	TokenType string `json:"token_type,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -53,6 +54,12 @@ func RequireAuth(cfg *config.Config) fiber.Handler {
 			})
 		}
 
+		if strings.EqualFold(claims.TokenType, "refresh") {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "Unauthorized: Refresh token cannot be used as access token",
+			})
+		}
+
 		if claims.ExpiresAt != nil && claims.ExpiresAt.Before(time.Now()) {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "Unauthorized: Token expired",
@@ -88,6 +95,9 @@ func ParseMobileToken(tokenString string, secret string) (*MobileClaims, error) 
 		return nil, err
 	}
 	if claims, ok := token.Claims.(*MobileClaims); ok && token.Valid {
+		if strings.EqualFold(claims.TokenType, "refresh") {
+			return nil, errors.New("refresh token cannot be used as access token")
+		}
 		return claims, nil
 	}
 	return nil, errors.New("invalid token")

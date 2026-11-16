@@ -3,6 +3,7 @@ package http
 import (
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
+	"super-app-chonburi-go-mobile/pkg/jwtutil"
 
 	"github.com/gofiber/fiber/v3"
 )
@@ -14,17 +15,18 @@ type notificationHandler struct {
 func NewNotificationHandler(app *fiber.App, uc domain.NotificationUseCase, cfg *config.Config) {
 	handler := &notificationHandler{uc: uc}
 
-	group := app.Group("/api/v1/notifications")
-
-	group.Get("/", handler.GetNotifications)
-	group.Post("/read-all", handler.MarkAllAsRead)
-	group.Post("/:id/read", handler.MarkAsRead)
+	for _, prefix := range []string{"/api/v1/notifications", "/api/v1/mobile/notifications"} {
+		group := app.Group(prefix, jwtutil.RequireAuth(cfg))
+		group.Get("/", handler.GetNotifications)
+		group.Post("/read-all", handler.MarkAllAsRead)
+		group.Post("/:id/read", handler.MarkAsRead)
+	}
 }
 
 func (h *notificationHandler) GetNotifications(c fiber.Ctx) error {
-	userID := c.Query("user_id")
-	if userID == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "user_id query param is required"})
+	userID, err := jwtutil.ExtractUserID(c)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	notifications, err := h.uc.GetNotifications(userID)
@@ -36,20 +38,13 @@ func (h *notificationHandler) GetNotifications(c fiber.Ctx) error {
 }
 
 func (h *notificationHandler) MarkAsRead(c fiber.Ctx) error {
+	userID, err := jwtutil.ExtractUserID(c)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
 	id := c.Params("id")
-	var req struct {
-		UserID string `json:"user_id"`
-	}
 
-	if err := c.Bind().JSON(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
-	}
-
-	if req.UserID == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "user_id is required"})
-	}
-
-	if err := h.uc.MarkAsRead(req.UserID, id); err != nil {
+	if err := h.uc.MarkAsRead(userID, id); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -57,19 +52,12 @@ func (h *notificationHandler) MarkAsRead(c fiber.Ctx) error {
 }
 
 func (h *notificationHandler) MarkAllAsRead(c fiber.Ctx) error {
-	var req struct {
-		UserID string `json:"user_id"`
+	userID, err := jwtutil.ExtractUserID(c)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	if err := c.Bind().JSON(&req); err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "invalid request body"})
-	}
-
-	if req.UserID == "" {
-		return c.Status(400).JSON(fiber.Map{"error": "user_id is required"})
-	}
-
-	if err := h.uc.MarkAllAsRead(req.UserID); err != nil {
+	if err := h.uc.MarkAllAsRead(userID); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 

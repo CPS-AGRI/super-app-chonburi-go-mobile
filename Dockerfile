@@ -21,7 +21,7 @@ FROM alpine:3.21
 
 WORKDIR /app
 
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata tesseract-ocr tesseract-ocr-data-tha tesseract-ocr-data-eng \
     && addgroup -S appgroup && adduser -S appuser -G appgroup
 
 # Copy compiled binary and static assets

@@ -90,3 +90,32 @@ func TestRequireAuth_AlgorithmConfusion_Rejected(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
 }
+
+func TestRequireAuth_RefreshToken_Rejected(t *testing.T) {
+	secret := "super-secret-key-that-is-at-least-32-bytes-long"
+	cfg := &config.Config{
+		JWTSecret: secret,
+	}
+
+	claims := &jwtutil.MobileClaims{
+		UserID:    "usr_12345",
+		TokenType: "refresh",
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenStr, err := token.SignedString([]byte(secret))
+	assert.NoError(t, err)
+
+	app := fiber.New()
+	app.Get("/protected", jwtutil.RequireAuth(cfg), func(c fiber.Ctx) error {
+		return c.SendString("SHOULD_NOT_REACH")
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/protected", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	resp, err := app.Test(req)
+	assert.NoError(t, err)
+	assert.Equal(t, fiber.StatusUnauthorized, resp.StatusCode)
+}

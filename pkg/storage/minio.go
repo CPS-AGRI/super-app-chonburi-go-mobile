@@ -32,6 +32,8 @@ func (s *minioStorage) Upload(file io.Reader, filename string) (string, error) {
 		contentType = "image/png"
 	case ".jpg", ".jpeg":
 		contentType = "image/jpeg"
+	case ".webp":
+		contentType = "image/webp"
 	}
 
 	data, err := io.ReadAll(file)

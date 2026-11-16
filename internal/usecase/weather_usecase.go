@@ -17,6 +17,7 @@ type WeatherUseCase interface {
 	GetMapTilesRange(ctx context.Context, variable, animType, date string, minRow, maxRow, minCol, maxCol int) (map[string]interface{}, error)
 	GetStationMonthlyStats(ctx context.Context, imei string, month, year int) (map[string]interface{}, error)
 	GetSubdistrictForecast(ctx context.Context, district, subdistrict, province string) (map[string]interface{}, error)
+	GetWeatherOverview(ctx context.Context, district, period, date string) (*domain.WeatherOverviewResult, error)
 	FlushCache(ctx context.Context) error
 }
 
@@ -95,4 +96,8 @@ func (u *weatherUseCase) GetSubdistrictForecast(ctx context.Context, district, s
 
 func (u *weatherUseCase) FlushCache(ctx context.Context) error {
 	return u.repo.FlushStationsCache(ctx)
+}
+
+func (u *weatherUseCase) GetWeatherOverview(ctx context.Context, district, period, date string) (*domain.WeatherOverviewResult, error) {
+	return u.repo.GetWeatherOverview(ctx, district, period, date)
 }

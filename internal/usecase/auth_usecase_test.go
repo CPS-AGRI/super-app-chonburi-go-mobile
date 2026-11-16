@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // MockAuthRepository implements domain.AuthRepository for testing
@@ -44,12 +45,25 @@ func (m *MockAuthRepository) GetByProviderID(provider, providerID string) (*doma
 	return args.Get(0).(*domain.AppUser), args.Error(1)
 }
 
+func (m *MockAuthRepository) GetByOAuthAccountID(oauthID uuid.UUID) (*domain.AppUser, error) {
+	args := m.Called(oauthID)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*domain.AppUser), args.Error(1)
+}
+
 func (m *MockAuthRepository) GetByID(id uuid.UUID) (*domain.AppUser, error) {
 	args := m.Called(id)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
 	}
 	return args.Get(0).(*domain.AppUser), args.Error(1)
+}
+
+func (m *MockAuthRepository) SoftDeleteUser(userID uuid.UUID) error {
+	args := m.Called(userID)
+	return args.Error(0)
 }
 
 func (m *MockAuthRepository) Create(user *domain.AppUser) error {
@@ -243,3 +257,180 @@ func TestRegister_InvalidSHA256Format(t *testing.T) {
 	assert.Nil(t, authRes)
 	assert.Contains(t, err.Error(), "invalid id_card_hash format")
 }
+
+func TestRequestOTP_ProductionHidesOTP(t *testing.T) {
+	cfg := &config.Config{
+		AppEnv:    "production",
+		JWTSecret: "test-secret-key-12345",
+	}
+	mockRepo := new(MockAuthRepository)
+	mockSMS := new(MockSMSService)
+	authUC := usecase.NewAuthUseCase(mockRepo, cfg, mockSMS, nil)
+
+	phone := "0812345678"
+	mockSMS.On("SendOTP", mock.Anything, phone, mock.Anything, mock.Anything).Return(nil)
+
+	res, err := authUC.RequestOTP(phone)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, res)
+	assert.True(t, res.Success)
+	assert.NotEmpty(t, res.Ref)
+	assert.Empty(t, res.OTP)
+	mockSMS.AssertExpectations(t)
+}
+
+func TestRequestOTP_FailsWhenSMSGatewayFails(t *testing.T) {
+	authUC, _, mockSMS, _ := setupTestUseCase()
+	phone := "0812345678"
+
+	mockSMS.On("SendOTP", mock.Anything, phone, mock.Anything, mock.Anything).Return(assert.AnError)
+
+	res, err := authUC.RequestOTP(phone)
+
+	assert.Error(t, err)
+	assert.Nil(t, res)
+	mockSMS.AssertExpectations(t)
+}
+
+func TestBindPhone_RejectsEmptyOTP(t *testing.T) {
+	authUC, _, _, _ := setupTestUseCase()
+	res, err := authUC.BindPhone("google", uuid.New().String(), "0812345678", "", "", "")
+	assert.Error(t, err)
+	assert.Nil(t, res)
+}
+
+func TestRefreshToken_RejectsAccessTokenType(t *testing.T) {
+	authUC, _, _, cfg := setupTestUseCase()
+	userID := uuid.New()
+
+	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id":    userID.String(),
+		"token_type": "access",
+		"exp":        time.Now().Add(time.Hour).Unix(),
+	})
+	tokenStr, _ := accessToken.SignedString([]byte(cfg.JWTSecret))
+
+	res, err := authUC.RefreshToken(tokenStr)
+	assert.Error(t, err)
+	assert.Nil(t, res)
+	assert.Contains(t, err.Error(), "access token cannot be used as refresh token")
+}
+
+func TestDeleteAccount_CallsSoftDeleteUser(t *testing.T) {
+	authUC, mockRepo, _, _ := setupTestUseCase()
+	userID := uuid.New()
+
+	mockRepo.On("SoftDeleteUser", userID).Return(nil)
+
+	err := authUC.DeleteAccount(userID)
+	assert.NoError(t, err)
+	mockRepo.AssertExpectations(t)
+}
+
+func TestVerifyOTP_RegisteredUser_ReturnsTempTokenAndResetPin(t *testing.T) {
+	authUC, mockRepo, mockSMS, _ := setupTestUseCase()
+	phone := "0812349999"
+	userID := uuid.New()
+	oldPinHash, _ := bcrypt.GenerateFromPassword([]byte("111111"), bcrypt.DefaultCost)
+
+	existingUser := &domain.AppUser{
+		ID:          userID,
+		PhoneNumber: phone,
+		PinHash:     string(oldPinHash),
+	}
+
+	mockSMS.On("SendOTP", mock.Anything, phone, mock.Anything, mock.Anything).Return(nil)
+	reqRes, err := authUC.RequestOTP(phone)
+	assert.NoError(t, err)
+
+	mockRepo.On("GetByPhoneNumber", phone).Return(existingUser, nil)
+	mockRepo.On("GetByID", userID).Return(existingUser, nil)
+	mockRepo.On("Update", mock.Anything).Return(nil)
+
+	verifyRes, err := authUC.VerifyOTP(phone, reqRes.OTP, reqRes.Ref)
+	assert.NoError(t, err)
+	assert.NotNil(t, verifyRes)
+	assert.True(t, verifyRes.IsRegistered)
+	assert.NotEmpty(t, verifyRes.TempToken)
+
+	// Now reset PIN using the temp_token returned by VerifyOTP
+	resetRes, err := authUC.ResetPin(verifyRes.TempToken, phone, "654321")
+	assert.NoError(t, err)
+	assert.NotNil(t, resetRes)
+	assert.NotEmpty(t, resetRes.AccessToken)
+	assert.NotEmpty(t, resetRes.RefreshToken)
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(existingUser.PinHash), []byte("654321")))
+}
+
+func TestChangePin_Success(t *testing.T) {
+	authUC, mockRepo, _, _ := setupTestUseCase()
+	userID := uuid.New()
+	oldPinHash, _ := bcrypt.GenerateFromPassword([]byte("123456"), bcrypt.DefaultCost)
+
+	existingUser := &domain.AppUser{
+		ID:          userID,
+		PhoneNumber: "0812348888",
+		PinHash:     string(oldPinHash),
+	}
+
+	mockRepo.On("GetByID", userID).Return(existingUser, nil)
+	mockRepo.On("Update", mock.Anything).Return(nil)
+
+	// Wrong old PIN fails
+	err := authUC.ChangePin(userID, "000000", "654321")
+	assert.Error(t, err)
+
+	// Correct old PIN succeeds
+	err = authUC.ChangePin(userID, "123456", "654321")
+	assert.NoError(t, err)
+	assert.NoError(t, bcrypt.CompareHashAndPassword([]byte(existingUser.PinHash), []byte("654321")))
+}
+
+func TestVerifyOTP_ThenBindPhone_DoubleConsumptionFixed(t *testing.T) {
+	authUC, mockRepo, mockSMS, _ := setupTestUseCase()
+	phone := "0812347777"
+	oauthAccID := uuid.New()
+	tempUserID := uuid.New()
+
+	tempUser := &domain.AppUser{
+		ID:          tempUserID,
+		PhoneNumber: "",
+		OauthAccounts: []domain.UserOauthAccount{
+			{
+				ID:         oauthAccID,
+				UserId:     tempUserID,
+				Provider:   "google",
+				ProviderId: "google-sub-123",
+				Email:      "user@example.com",
+			},
+		},
+		Information: &domain.UserInformation{
+			UserId: tempUserID,
+			Name:   "Test",
+		},
+	}
+
+	mockSMS.On("SendOTP", mock.Anything, phone, mock.Anything, mock.Anything).Return(nil)
+	reqRes, err := authUC.RequestOTP(phone)
+	assert.NoError(t, err)
+
+	// Step 1: Mobile app calls VerifyOTP first (consumes OTP, sets verified marker)
+	mockRepo.On("GetByPhoneNumber", phone).Return(nil, assert.AnError)
+	verifyRes, err := authUC.VerifyOTP(phone, reqRes.OTP, reqRes.Ref)
+	assert.NoError(t, err)
+	assert.True(t, verifyRes.Success)
+
+	// Step 2: Mobile app calls BindPhone next (even with empty OTP or consumed OTP)
+	mockRepo.On("GetByOAuthAccountID", oauthAccID).Return(tempUser, nil)
+	mockRepo.On("GetByID", tempUserID).Return(tempUser, nil)
+	mockRepo.On("Update", mock.Anything).Return(nil)
+
+	bindRes, err := authUC.BindPhone("google", oauthAccID.String(), phone, "", "", "123456")
+	assert.NoError(t, err)
+	assert.NotNil(t, bindRes)
+	assert.NotEmpty(t, bindRes.AccessToken)
+	assert.Equal(t, phone, bindRes.User.PhoneNumber)
+}
+
+

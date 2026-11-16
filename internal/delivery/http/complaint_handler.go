@@ -1,9 +1,12 @@
 package http
 
 import (
+	"errors"
+	"log"
 	"strconv"
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
+	"super-app-chonburi-go-mobile/internal/usecase"
 	"super-app-chonburi-go-mobile/pkg/jwtutil"
 
 	"github.com/gofiber/fiber/v3"
@@ -16,15 +19,17 @@ type complaintHandler struct {
 func NewComplaintHandler(app *fiber.App, useCase domain.ComplaintUseCase, cfg *config.Config) {
 	handler := &complaintHandler{useCase: useCase}
 
-	group := app.Group("/api/v1/complaints", jwtutil.RequireAuth(cfg))
-
-	group.Get("/", handler.GetMyComplaints)
-	group.Post("/", handler.AddComplaint)
-	group.Patch("/:id", handler.UpdateComplaint)
-	group.Get("/:id", handler.GetDetail)
-	group.Delete("/:id", handler.CancelComplaint)
-	group.Post("/:id/rate", handler.Rate)
-	group.Post("/:id/dispute", handler.Dispute)
+	for _, prefix := range []string{"/api/v1/complaints", "/api/v1/mobile/complaints"} {
+		group := app.Group(prefix, jwtutil.RequireAuth(cfg))
+		group.Get("/", handler.GetMyComplaints)
+		group.Post("/", handler.AddComplaint)
+		group.Patch("/:id", handler.UpdateComplaint)
+		group.Get("/:id", handler.GetDetail)
+		group.Delete("/:id", handler.CancelComplaint)
+		group.Post("/:id/cancel", handler.CancelComplaint)
+		group.Post("/:id/rate", handler.Rate)
+		group.Post("/:id/dispute", handler.Dispute)
+	}
 }
 
 func (h *complaintHandler) GetMyComplaints(c fiber.Ctx) error {
@@ -41,6 +46,9 @@ func (h *complaintHandler) GetMyComplaints(c fiber.Ctx) error {
 	limit, err := strconv.Atoi(c.Query("limit", "10"))
 	if err != nil || limit < 1 {
 		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
 	}
 
 	complaints, err := h.useCase.GetMyComplaints(userID, status, search, page, limit)
@@ -82,7 +90,11 @@ func (h *complaintHandler) AddComplaint(c fiber.Ctx) error {
 	}
 
 	if err := h.useCase.AddComplaint(complaint, req.Images); err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		if errors.Is(err, usecase.ErrMinimumComplaintImages) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+		log.Printf("⚠️ [ComplaintHandler] AddComplaint failed: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "failed to submit complaint"})
 	}
 
 	return c.Status(201).JSON(fiber.Map{"data": complaint})
@@ -120,6 +132,9 @@ func (h *complaintHandler) UpdateComplaint(c fiber.Ctx) error {
 	}
 
 	if err := h.useCase.UpdateComplaint(complaint, req.Images); err != nil {
+		if errors.Is(err, usecase.ErrMinimumComplaintImages) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 

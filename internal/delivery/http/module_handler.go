@@ -1,6 +1,8 @@
 package http
 
 import (
+	"log"
+
 	"github.com/gofiber/fiber/v3"
 	"super-app-chonburi-go-mobile/internal/domain"
 )
@@ -12,8 +14,10 @@ type moduleHandler struct {
 func NewModuleHandler(app *fiber.App, useCase domain.ModuleUseCase) {
 	handler := &moduleHandler{useCase: useCase}
 
-	group := app.Group("/api/v1/module-types")
-	group.Get("/", handler.GetModuleTypes)
+	for _, prefix := range []string{"/api/v1/module-types", "/api/v1/mobile/module-types"} {
+		group := app.Group(prefix)
+		group.Get("/", handler.GetModuleTypes)
+	}
 }
 
 func (h *moduleHandler) GetModuleTypes(c fiber.Ctx) error {
@@ -25,7 +29,8 @@ func (h *moduleHandler) GetModuleTypes(c fiber.Ctx) error {
 
 	moduleTypes, err := h.useCase.GetModuleTypesByModuleID(moduleID)
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		log.Printf("⚠️ [ModuleHandler] GetModuleTypes failed: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "failed to load module types"})
 	}
 
 	return c.JSON(fiber.Map{"data": moduleTypes})

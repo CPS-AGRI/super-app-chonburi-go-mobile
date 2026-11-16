@@ -1,21 +1,77 @@
 package usecase
 
 import (
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"math/rand"
+	"math/big"
 	"super-app-chonburi-go-mobile/internal/domain"
 	"time"
 
 	"github.com/google/uuid"
 )
 
+var ErrMinimumComplaintImages = errors.New("กรุณาแนบรูปภาพประกอบอย่างน้อย 2 รูป")
+
 type complaintUseCase struct {
-	repo domain.ComplaintRepository
+	repo       domain.ComplaintRepository
+	notifyUser func(userID uuid.UUID, title, body, refID, refStatus, notifType string)
+	notifyDept func(departmentID string, role string, title, body, refID, refStatus string)
 }
 
 func NewComplaintUseCase(repo domain.ComplaintRepository) domain.ComplaintUseCase {
-	return &complaintUseCase{repo: repo}
+	return &complaintUseCase{
+		repo:       repo,
+		notifyUser: SendNotificationToUser,
+		notifyDept: SendNotificationToDepartment,
+	}
+}
+
+func NewComplaintUseCaseWithNotifiers(
+	repo domain.ComplaintRepository,
+	notifyUser func(userID uuid.UUID, title, body, refID, refStatus, notifType string),
+	notifyDept func(departmentID string, role string, title, body, refID, refStatus string),
+) domain.ComplaintUseCase {
+	return &complaintUseCase{
+		repo:       repo,
+		notifyUser: notifyUser,
+		notifyDept: notifyDept,
+	}
+}
+
+func (u *complaintUseCase) sendPendingComplaintNotifications(complaint *domain.Complaint) {
+	if complaint == nil || complaint.Status == domain.ComplaintStatusDraft {
+		return
+	}
+
+	if u.notifyUser != nil {
+		if parsedUserUUID, err := uuid.Parse(complaint.UserId); err == nil {
+			u.notifyUser(
+				parsedUserUUID,
+				"ยื่นคำร้องร้องเรียนสำเร็จ",
+				fmt.Sprintf("เราได้รับเรื่องร้องเรียนเลขที่ %s เรียบร้อยแล้ว (สถานะ: รอดำเนินการ)", complaint.DocumentId),
+				complaint.ID,
+				"pending",
+				"complaint",
+			)
+		}
+	}
+
+	if u.notifyDept != nil {
+		deptID := ""
+		if complaint.DepartmentId != nil {
+			deptID = *complaint.DepartmentId
+		}
+		u.notifyDept(
+			deptID,
+			"Managers",
+			"มีเรื่องร้องเรียนใหม่ส่งเข้ามา",
+			fmt.Sprintf("เรื่องร้องเรียนเลขที่ %s เรื่อง: %s รอนุมัติรับเรื่องและส่งต่อทำงาน", complaint.DocumentId, complaint.Description),
+			complaint.ID,
+			"pending",
+		)
+	}
 }
 
 func (u *complaintUseCase) AddComplaint(complaint *domain.Complaint, imageURLs []string) error {
@@ -26,6 +82,9 @@ func (u *complaintUseCase) AddComplaint(complaint *domain.Complaint, imageURLs [
 
 	if complaint.Status != domain.ComplaintStatusDraft {
 		complaint.Status = domain.ComplaintStatusPending
+		if len(imageURLs) < 2 {
+			return ErrMinimumComplaintImages
+		}
 	}
 
 	for i, url := range imageURLs {
@@ -46,29 +105,9 @@ func (u *complaintUseCase) AddComplaint(complaint *domain.Complaint, imageURLs [
 		return err
 	}
 
-	if parsedUserUUID, err := uuid.Parse(complaint.UserId); err == nil {
-		SendNotificationToUser(
-			parsedUserUUID,
-			"ยื่นคำร้องร้องเรียนสำเร็จ",
-			fmt.Sprintf("เราได้รับเรื่องร้องเรียนเลขที่ %s เรียบร้อยแล้ว (สถานะ: รอดำเนินการ)", complaint.DocumentId),
-			complaint.ID,
-			"pending",
-			"complaint",
-		)
+	if complaint.Status != domain.ComplaintStatusDraft {
+		u.sendPendingComplaintNotifications(complaint)
 	}
-
-	deptID := ""
-	if complaint.DepartmentId != nil {
-		deptID = *complaint.DepartmentId
-	}
-	SendNotificationToDepartment(
-		deptID,
-		"Managers",
-		"มีเรื่องร้องเรียนใหม่ส่งเข้ามา",
-		fmt.Sprintf("เรื่องร้องเรียนเลขที่ %s เรื่อง: %s รอนุมัติรับเรื่องและส่งต่อทำงาน", complaint.DocumentId, complaint.Description),
-		complaint.ID,
-		"pending",
-	)
 
 	return nil
 }
@@ -94,11 +133,20 @@ func (u *complaintUseCase) UpdateComplaint(complaint *domain.Complaint, imageURL
 		return fmt.Errorf("สามารถแก้ไขได้เฉพาะเรื่องร้องเรียนที่อยู่ในสถานะแบบร่าง หรือรอดำเนินการเท่านั้น")
 	}
 
+	wasDraft := existing.Status == domain.ComplaintStatusDraft
+
 	existing.Description = complaint.Description
 	existing.ModuleTypeId = complaint.ModuleTypeId
 	existing.Latitude = complaint.Latitude
 	existing.Longitude = complaint.Longitude
-	existing.Status = complaint.Status
+	if complaint.Status == domain.ComplaintStatusDraft || complaint.Status == domain.ComplaintStatusPending {
+		existing.Status = complaint.Status
+	} else if existing.Status != domain.ComplaintStatusDraft {
+		existing.Status = domain.ComplaintStatusPending
+	}
+	if existing.Status == domain.ComplaintStatusPending && len(imageURLs) < 2 {
+		return ErrMinimumComplaintImages
+	}
 	existing.UpdatedDate = time.Now()
 	existing.UpdatedBy = complaint.UserId
 
@@ -116,10 +164,28 @@ func (u *complaintUseCase) UpdateComplaint(complaint *domain.Complaint, imageURL
 		})
 	}
 
-	return u.repo.Update(existing)
+	if err := u.repo.Update(existing); err != nil {
+		return err
+	}
+
+	// Only notify when a draft is officially submitted (draft -> pending); never notify for drafts.
+	if wasDraft && existing.Status == domain.ComplaintStatusPending {
+		u.sendPendingComplaintNotifications(existing)
+	}
+
+	return nil
 }
 
 func (u *complaintUseCase) GetMyComplaints(userID string, status string, search string, page int, limit int) ([]domain.Complaint, error) {
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
+	}
 	return u.repo.GetByUserID(userID, status, search, page, limit)
 }
 
@@ -320,7 +386,12 @@ func (u *complaintUseCase) DisputeComplaint(id string, userID string, reason str
 
 func generateDocumentID() string {
 	now := time.Now()
-	rand.Seed(time.Now().UnixNano())
-	randomPart := rand.Intn(9999)
-	return fmt.Sprintf("CP-%s-%04d", now.Format("20060102"), randomPart)
+	nBig, err := rand.Int(rand.Reader, big.NewInt(1000000))
+	var randomPart int64
+	if err == nil && nBig != nil {
+		randomPart = nBig.Int64()
+	} else {
+		randomPart = now.UnixNano() % 1000000
+	}
+	return fmt.Sprintf("CP-%s-%06d", now.Format("20060102"), randomPart)
 }

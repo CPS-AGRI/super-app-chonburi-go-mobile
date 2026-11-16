@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -18,26 +19,69 @@ func NewAuthRepository(db *gorm.DB) domain.AuthRepository {
 	return &authRepository{db: db}
 }
 
+func isUserSoftDeleted(user *domain.AppUser) bool {
+	if user == nil {
+		return true
+	}
+	if strings.HasPrefix(user.PhoneNumber, "DELETED_") {
+		return true
+	}
+	if user.Information != nil {
+		status := strings.ToLower(strings.TrimSpace(user.Information.Status))
+		if status == "inactive" || status == "deleted" {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *authRepository) GetByID(id uuid.UUID) (*domain.AppUser, error) {
 	var user domain.AppUser
 	err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, id).Error
 	if err != nil {
 		return nil, err
 	}
+	if isUserSoftDeleted(&user) {
+		return nil, gorm.ErrRecordNotFound
+	}
 	return &user, nil
 }
 
 func (r *authRepository) GetByProviderID(provider, providerID string) (*domain.AppUser, error) {
-	var oauthAcc domain.UserOauthAccount
-	err := r.db.Where("LOWER(provider) = LOWER(?) AND provider_id = ?", provider, providerID).First(&oauthAcc).Error
+	var oauthAccs []domain.UserOauthAccount
+	err := r.db.Where("LOWER(provider) = LOWER(?) AND provider_id = ?", provider, providerID).
+		Order("created_at DESC").
+		Find(&oauthAccs).Error
 	if err != nil {
+		return nil, err
+	}
+	if len(oauthAccs) == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+
+	for _, oauthAcc := range oauthAccs {
+		var user domain.AppUser
+		if err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, oauthAcc.UserId).Error; err == nil {
+			if !isUserSoftDeleted(&user) {
+				return &user, nil
+			}
+		}
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (r *authRepository) GetByOAuthAccountID(oauthID uuid.UUID) (*domain.AppUser, error) {
+	var oauthAcc domain.UserOauthAccount
+	if err := r.db.Where("id = ?", oauthID).First(&oauthAcc).Error; err != nil {
 		return nil, err
 	}
 
 	var user domain.AppUser
-	err = r.db.Preload("Information").Preload("OauthAccounts").First(&user, oauthAcc.UserId).Error
-	if err != nil {
+	if err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, oauthAcc.UserId).Error; err != nil {
 		return nil, err
+	}
+	if isUserSoftDeleted(&user) {
+		return nil, gorm.ErrRecordNotFound
 	}
 	return &user, nil
 }
@@ -47,25 +91,17 @@ func (r *authRepository) GetByEmail(email string) (*domain.AppUser, error) {
 		return nil, gorm.ErrRecordNotFound
 	}
 
-	// 1. Search in users table
-	var user domain.AppUser
-	if err := r.db.Preload("Information").Preload("OauthAccounts").Where("email = ?", email).First(&user).Error; err == nil {
-		return &user, nil
-	}
-
-	// 2. Search in user_informations table
-	var info domain.UserInformation
-	if err := r.db.Where("email = ?", email).First(&info).Error; err == nil {
-		if err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, info.UserId).Error; err == nil {
-			return &user, nil
-		}
-	}
-
-	// 3. Search in user_oauth_accounts table
-	var oauthAcc domain.UserOauthAccount
-	if err := r.db.Where("email = ?", email).First(&oauthAcc).Error; err == nil {
-		if err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, oauthAcc.UserId).Error; err == nil {
-			return &user, nil
+	// Only match verified OAuth accounts in user_oauth_accounts table to prevent pre-account takeover
+	// of unverified email addresses in users / user_informations.
+	var oauthAccs []domain.UserOauthAccount
+	if err := r.db.Where("email = ?", email).Order("created_at DESC").Find(&oauthAccs).Error; err == nil {
+		for _, oauthAcc := range oauthAccs {
+			var user domain.AppUser
+			if err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, oauthAcc.UserId).Error; err == nil {
+				if !isUserSoftDeleted(&user) {
+					return &user, nil
+				}
+			}
 		}
 	}
 
@@ -73,7 +109,7 @@ func (r *authRepository) GetByEmail(email string) (*domain.AppUser, error) {
 }
 
 func (r *authRepository) GetByPhoneNumber(phoneNumber string) (*domain.AppUser, error) {
-	if phoneNumber == "" {
+	if phoneNumber == "" || strings.HasPrefix(phoneNumber, "DELETED_") {
 		return nil, gorm.ErrRecordNotFound
 	}
 	clean := phoneNumber
@@ -94,12 +130,20 @@ func (r *authRepository) GetByPhoneNumber(phoneNumber string) (*domain.AppUser, 
 		formats = append(formats, "0"+suffix, "+66"+suffix)
 	}
 
-	var user domain.AppUser
-	err := r.db.Preload("Information").Preload("OauthAccounts").Where("phone_number IN ?", formats).First(&user).Error
+	var users []domain.AppUser
+	err := r.db.Preload("Information").Preload("OauthAccounts").
+		Where("phone_number IN ?", formats).
+		Order("updated_date DESC").
+		Find(&users).Error
 	if err != nil {
 		return nil, err
 	}
-	return &user, nil
+	for i := range users {
+		if !isUserSoftDeleted(&users[i]) {
+			return &users[i], nil
+		}
+	}
+	return nil, gorm.ErrRecordNotFound
 }
 
 func (r *authRepository) Create(user *domain.AppUser) error {
@@ -161,6 +205,79 @@ func (r *authRepository) Delete(user *domain.AppUser) error {
 	})
 }
 
+func (r *authRepository) SoftDeleteUser(userID uuid.UUID) error {
+	now := time.Now()
+	shortID := userID.String()
+	if len(shortID) > 8 {
+		shortID = shortID[:8]
+	}
+
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var user domain.AppUser
+		if err := tx.First(&user, "id = ?", userID).Error; err != nil {
+			return err
+		}
+
+		// 1. Scrub PII on users row while preserving row for foreign-key referential integrity
+		if err := tx.Model(&domain.AppUser{}).Where("id = ?", userID).Updates(map[string]interface{}{
+			"phone_number":      "DELETED_" + userID.String(),
+			"phone_number_hash": "DELETED_" + userID.String(),
+			"pin_hash":          "",
+			"email":             nil,
+			"email_hash":        nil,
+			"image_profile_url": nil,
+			"is_consent":        false,
+			"updated_by":        "user_soft_delete",
+			"updated_date":      now,
+		}).Error; err != nil {
+			return err
+		}
+
+		// 2. Scrub PII on user_informations row and set status = inactive
+		if err := tx.Model(&domain.UserInformation{}).Where("user_id = ?", userID).Updates(map[string]interface{}{
+			"status":                    "inactive",
+			"verification_status":       "unverified",
+			"prefix":                    "",
+			"name":                      "ผู้ใช้งานที่ยกเลิกบัญชี",
+			"last_name":                 "",
+			"phone":                     "DELETED_" + shortID,
+			"email":                     nil,
+			"birthday":                  nil,
+			"identity_number_encrypted": "",
+			"identity_number_hash":      "DELETED_" + userID.String(),
+			"id_card_photo_url":         nil,
+			"id_card_expiry":            nil,
+			"house_number":              "",
+			"village_number":            "",
+			"alley":                     "",
+			"intersection":              "",
+			"road":                      "",
+			"building_name":             "",
+			"room_number":               "",
+			"card_address":              "",
+			"logo_url":                  "",
+			"is_consent":                false,
+			"updated_by":                "user_soft_delete",
+			"updated_date":              now,
+		}).Error; err != nil {
+			return err
+		}
+
+		// 3. Delete linked OAuth accounts, FCM tokens, and weather subscriptions
+		if err := tx.Where("user_id = ?", userID).Delete(&domain.UserOauthAccount{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", userID).Delete(&domain.UserFCMToken{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ?", userID).Delete(&domain.UserWeatherSubscription{}).Error; err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
 func (r *authRepository) GetSocialLinks(userID uuid.UUID) (*domain.SocialAccountsResponse, error) {
 	var accounts []domain.UserOauthAccount
 	err := r.db.Where("user_id = ?", userID).Find(&accounts).Error
@@ -218,34 +335,128 @@ func (r *authRepository) GetSocialLinks(userID uuid.UUID) (*domain.SocialAccount
 	return resp, nil
 }
 
+// SocialUnlinkCleanup describes which profile fields should be cleared when unlinking a social account.
+type SocialUnlinkCleanup struct {
+	ClearImageProfileURL bool
+	ClearInfoLogoURL     bool
+	ClearUserEmail       bool
+	ClearInfoEmail       bool
+}
+
+// ResolveSocialUnlinkCleanup determines whether avatar/email came solely from the unlinked OAuth account
+// and should be cleared upon unlinking without disturbing manually entered data or remaining linked accounts.
+func ResolveSocialUnlinkCleanup(user *domain.AppUser, target *domain.UserOauthAccount, remaining []domain.UserOauthAccount) SocialUnlinkCleanup {
+	var cleanup SocialUnlinkCleanup
+	if user == nil || target == nil {
+		return cleanup
+	}
+
+	if target.AvatarUrl != "" {
+		sharedAvatar := false
+		for _, other := range remaining {
+			if other.AvatarUrl == target.AvatarUrl {
+				sharedAvatar = true
+				break
+			}
+		}
+		if !sharedAvatar {
+			if user.ImageProfileUrl != nil && *user.ImageProfileUrl == target.AvatarUrl {
+				cleanup.ClearImageProfileURL = true
+			}
+			if user.Information != nil && user.Information.LogoUrl == target.AvatarUrl {
+				cleanup.ClearInfoLogoURL = true
+			}
+		}
+	}
+
+	hasManualEmail := user.EmailHash != nil && *user.EmailHash != ""
+	if target.Email != "" && !hasManualEmail {
+		sharedEmail := false
+		for _, other := range remaining {
+			if other.Email != "" && strings.EqualFold(other.Email, target.Email) {
+				sharedEmail = true
+				break
+			}
+		}
+		if !sharedEmail {
+			if user.Email != nil && strings.EqualFold(*user.Email, target.Email) {
+				cleanup.ClearUserEmail = true
+			}
+			if user.Information != nil && user.Information.Email != nil && strings.EqualFold(*user.Information.Email, target.Email) {
+				cleanup.ClearInfoEmail = true
+			}
+		}
+	}
+
+	return cleanup
+}
+
 func (r *authRepository) UnlinkSocial(userID uuid.UUID, provider string) error {
 	var user domain.AppUser
-	if err := r.db.First(&user, userID).Error; err != nil {
+	if err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, userID).Error; err != nil {
 		return fmt.Errorf("user not found: %w", err)
+	}
+
+	var target *domain.UserOauthAccount
+	var remaining []domain.UserOauthAccount
+	for i := range user.OauthAccounts {
+		acc := user.OauthAccounts[i]
+		if target == nil && strings.EqualFold(acc.Provider, provider) {
+			target = &acc
+		} else {
+			remaining = append(remaining, acc)
+		}
+	}
+
+	if target == nil {
+		return errors.New("ไม่พบบัญชีที่เชื่อมต่อสำหรับบริการนี้")
 	}
 
 	// Safety check: Don't allow unlink if this is the user's ONLY login method
 	hasPhonePin := user.PhoneNumber != "" && user.PinHash != ""
-	if !hasPhonePin {
-		var otherCount int64
-		_ = r.db.Model(&domain.UserOauthAccount{}).
-			Where("user_id = ? AND LOWER(provider) != LOWER(?)", userID, provider).
-			Count(&otherCount)
+	if !hasPhonePin && len(remaining) == 0 {
+		return errors.New("ไม่สามารถยกเลิกการเชื่อมต่อได้ เนื่องจากเป็นช่องทางเข้าสู่ระบบเดียวของคุณ กรุณาตั้งค่าเบอร์โทรศัพท์และรหัส PIN ก่อน")
+	}
 
-		if otherCount == 0 {
-			return errors.New("ไม่สามารถยกเลิกการเชื่อมต่อได้ เนื่องจากเป็นช่องทางเข้าสู่ระบบเดียวของคุณ กรุณาตั้งค่าเบอร์โทรศัพท์และรหัส PIN ก่อน")
+	cleanup := ResolveSocialUnlinkCleanup(&user, target, remaining)
+
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		res := tx.Where("user_id = ? AND LOWER(provider) = LOWER(?)", userID, provider).Delete(&domain.UserOauthAccount{})
+		if res.Error != nil {
+			return res.Error
 		}
-	}
+		if res.RowsAffected == 0 {
+			return errors.New("ไม่พบบัญชีที่เชื่อมต่อสำหรับบริการนี้")
+		}
 
-	res := r.db.Where("user_id = ? AND LOWER(provider) = LOWER(?)", userID, provider).Delete(&domain.UserOauthAccount{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return errors.New("ไม่พบบัญชีที่เชื่อมต่อสำหรับบริการนี้")
-	}
+		userUpdates := map[string]interface{}{}
+		if cleanup.ClearImageProfileURL {
+			userUpdates["image_profile_url"] = nil
+		}
+		if cleanup.ClearUserEmail {
+			userUpdates["email"] = nil
+		}
+		if len(userUpdates) > 0 {
+			if err := tx.Model(&domain.AppUser{}).Where("id = ?", userID).Updates(userUpdates).Error; err != nil {
+				return err
+			}
+		}
 
-	return nil
+		infoUpdates := map[string]interface{}{}
+		if cleanup.ClearInfoLogoURL {
+			infoUpdates["logo_url"] = ""
+		}
+		if cleanup.ClearInfoEmail {
+			infoUpdates["email"] = nil
+		}
+		if len(infoUpdates) > 0 {
+			if err := tx.Model(&domain.UserInformation{}).Where("user_id = ?", userID).Updates(infoUpdates).Error; err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
 }
 
 func (r *authRepository) LinkSocialAccount(userID uuid.UUID, account *domain.UserOauthAccount) error {

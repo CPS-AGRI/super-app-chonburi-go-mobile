@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"log"
 	"os"
 	"strconv"
@@ -10,6 +12,7 @@ import (
 )
 
 type Config struct {
+	AppEnv             string
 	AppPort            string
 	DBDsn              string
 	OrgName            string
@@ -21,6 +24,7 @@ type Config struct {
 	FacebookAppSecret  string
 	LineChannelID      string
 	LineChannelSecret  string
+	AppleBundleID      string
 
 	ThaiIDClientID     string
 	ThaiIDClientSecret string
@@ -30,6 +34,8 @@ type Config struct {
 	// Security: Thai citizen ID (PID) protection — PDPA compliance
 	PIDHmacSecret    string // HMAC-SHA256 key for PID hashing (lookup)
 	PIDEncryptionKey string // AES-256-GCM key (must be exactly 32 bytes in hex)
+	AllowDebugOTP    bool
+	InternalOCRURL   string
 
 	SMTPHost     string
 	SMTPPort     string
@@ -40,10 +46,13 @@ type Config struct {
 	TaxUploadDir string
 	MinIO        MinIOConfig
 
-	SMSGatewayURL string
-	SMSAPIKey     string
-	SMSAPISecret  string
-	SMSSenderName string
+	SMSGatewayURL   string
+	SMSAPIKey       string
+	SMSAPISecret    string
+	SMSSenderName   string
+	SMSRelayEnabled bool
+	SMSRelayURL     string
+	SMSRelaySecret  string
 
 	RedisHost     string
 	RedisPort     string
@@ -153,6 +162,13 @@ func LoadConfig() *Config {
 	minioMaxUploadSizeMB := int64(getEnvInt("MINIO_MAX_UPLOAD_SIZE_MB", 10))
 
 	return &Config{
+		AppEnv: func() string {
+			env := strings.TrimSpace(os.Getenv("APP_ENV"))
+			if env == "" {
+				return "development"
+			}
+			return env
+		}(),
 		AppPort:            port,
 		DBDsn:              dsn,
 		OrgName:            orgName,
@@ -164,6 +180,13 @@ func LoadConfig() *Config {
 		FacebookAppSecret:  os.Getenv("FACEBOOK_APP_SECRET"),
 		LineChannelID:      os.Getenv("LINE_CHANNEL_ID"),
 		LineChannelSecret:  os.Getenv("LINE_CHANNEL_SECRET"),
+		AppleBundleID: func() string {
+			b := strings.TrimSpace(os.Getenv("APPLE_BUNDLE_ID"))
+			if b == "" {
+				return "com.chonburipaoconnext.mobile"
+			}
+			return b
+		}(),
 		ThaiIDClientID: func() string {
 			cid := os.Getenv("THAIID_CLIENT_ID")
 			if cid == "" {
@@ -180,8 +203,26 @@ func LoadConfig() *Config {
 			}
 			return uri
 		}(),
-		PIDHmacSecret:     os.Getenv("PID_HMAC_SECRET"),
-		PIDEncryptionKey:  os.Getenv("PID_ENCRYPTION_KEY"),
+		PIDHmacSecret: func() string {
+			sec := strings.TrimSpace(os.Getenv("PID_HMAC_SECRET"))
+			if sec == "" {
+				log.Println("⚠️  Warning: PID_HMAC_SECRET is empty; deriving deterministic HMAC secret from JWT_SECRET")
+				sum := sha256.Sum256([]byte("pid-hmac:" + jwtSecret))
+				return hex.EncodeToString(sum[:])
+			}
+			return sec
+		}(),
+		PIDEncryptionKey: func() string {
+			key := strings.TrimSpace(os.Getenv("PID_ENCRYPTION_KEY"))
+			if decoded, err := hex.DecodeString(key); err != nil || len(decoded) != 32 {
+				log.Println("⚠️  Warning: PID_ENCRYPTION_KEY is empty or not 64 hex chars; deriving deterministic 32-byte key from JWT_SECRET")
+				sum := sha256.Sum256([]byte("pid-aes256gcm:" + jwtSecret))
+				return hex.EncodeToString(sum[:])
+			}
+			return key
+		}(),
+		AllowDebugOTP:  getEnvBool("ALLOW_DEBUG_OTP", false),
+		InternalOCRURL: strings.TrimSpace(os.Getenv("INTERNAL_OCR_URL")),
 		SMTPHost:           os.Getenv("SMTP_HOST"),
 		SMTPPort:           os.Getenv("SMTP_PORT"),
 		SMTPEmail:          os.Getenv("SMTP_EMAIL"),
@@ -200,10 +241,13 @@ func LoadConfig() *Config {
 			PresignURLTTL:   minioPresignURLTTL,
 			MaxUploadSizeMB: minioMaxUploadSizeMB,
 		},
-		SMSGatewayURL: os.Getenv("SMS_GATEWAY_URL"),
-		SMSAPIKey:     os.Getenv("SMS_API_KEY"),
-		SMSAPISecret:  os.Getenv("SMS_API_SECRET"),
-		SMSSenderName: os.Getenv("SMS_SENDER_NAME"),
+		SMSGatewayURL:   os.Getenv("SMS_GATEWAY_URL"),
+		SMSAPIKey:       os.Getenv("SMS_API_KEY"),
+		SMSAPISecret:    os.Getenv("SMS_API_SECRET"),
+		SMSSenderName:   os.Getenv("SMS_SENDER_NAME"),
+		SMSRelayEnabled: getEnvBool("SMS_RELAY_ENABLED", false),
+		SMSRelayURL:     strings.TrimSpace(os.Getenv("SMS_RELAY_URL")),
+		SMSRelaySecret:  strings.TrimSpace(os.Getenv("SMS_RELAY_SECRET")),
 		RedisHost: os.Getenv("REDIS_HOST"),
 		RedisPort: func() string {
 			p := os.Getenv("REDIS_PORT")

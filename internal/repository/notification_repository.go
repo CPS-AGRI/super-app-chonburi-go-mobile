@@ -50,6 +50,8 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 		LEFT JOIN weather_alert_history wah ON wah.id::text = n.reference_id
 		LEFT JOIN module_user_notifications un ON un.module_notification_id = n.id AND un.user_id = ?
 		WHERE (n.user_id = ? OR (n.user_id IS NULL AND n.type = 'user' AND (n.module_id IS NULL OR n.module_id != '10e5e192-8254-479b-ab83-86bfd09504eb')))
+		ORDER BY n.updated_date DESC
+		LIMIT 200
 	`, userID, userID).Scan(&txItems).Error
 	if err != nil {
 		return nil, err
@@ -73,12 +75,18 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 		LEFT JOIN modules m ON m.id = p.module_id
 		LEFT JOIN module_user_notifications un ON un.module_notification_id = p.id AND un.user_id = ?
 		WHERE p.status = 'active' AND (p.send_date IS NULL OR p.send_date <= NOW())
+		ORDER BY p.updated_date DESC
+		LIMIT 100
 	`, userID).Scan(&prItems).Error
 	if err != nil {
 		return nil, err
 	}
 
-	var results []domain.NotificationResponseItem
+	type sortableNotification struct {
+		item        domain.NotificationResponseItem
+		updatedTime time.Time
+	}
+	sortable := make([]sortableNotification, 0, len(txItems)+len(prItems))
 
 	for _, item := range txItems {
 		notifType := "general"
@@ -94,28 +102,31 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 			notifType = "complaint"
 		} else if strings.Contains(nameLower, "ภาษี") || strings.Contains(nameLower, "tax") {
 			notifType = "tax"
-		} else if strings.Contains(nameLower, "น้ำท่วม") || strings.Contains(nameLower, "flood") || strings.Contains(nameLower, "ภัย") {
+		} else if strings.Contains(nameLower, "สภาพอากาศ") || strings.Contains(nameLower, "weather") || strings.Contains(titleLower, "สภาพอากาศ") || strings.Contains(titleLower, "pm2.5") || strings.Contains(titleLower, "ค่าฝุ่น") || strings.Contains(titleLower, "ฝนตก") {
+			notifType = "weather"
+		} else if strings.Contains(nameLower, "น้ำท่วม") || strings.Contains(nameLower, "flood") || strings.Contains(titleLower, "ระดับน้ำ") || strings.Contains(titleLower, "น้ำท่วม") || strings.Contains(titleLower, "อุทกภัย") || strings.Contains(bodyLower, "ระดับน้ำ") {
 			notifType = "flood"
 		} else if strings.Contains(nameLower, "กล้อง") || strings.Contains(nameLower, "cctv") {
 			notifType = "cctv"
-		} else if strings.Contains(nameLower, "สภาพอากาศ") || strings.Contains(nameLower, "weather") {
-			notifType = "weather"
 		} else if strings.Contains(nameLower, "ยืนยัน") || strings.Contains(nameLower, "register") || strings.Contains(nameLower, "verify") {
 			notifType = "register"
 		}
 
-		results = append(results, domain.NotificationResponseItem{
-			ID:          item.ID.String(),
-			Title:       item.ReferenceTitle,
-			Description: item.ReferenceBody,
-			Date:        item.CreatedDate.Format(time.RFC3339),
-			UpdatedDate: item.UpdatedDate.Format(time.RFC3339),
-			Type:        notifType,
-			Read:        item.Read,
-			ReferenceID: item.ReferenceID,
-			Source:      "general",
-			ImageURL:    item.ImageURL,
-			Severity:    item.Severity,
+		sortable = append(sortable, sortableNotification{
+			updatedTime: item.UpdatedDate,
+			item: domain.NotificationResponseItem{
+				ID:          item.ID.String(),
+				Title:       item.ReferenceTitle,
+				Description: item.ReferenceBody,
+				Date:        item.CreatedDate.Format(time.RFC3339),
+				UpdatedDate: item.UpdatedDate.Format(time.RFC3339),
+				Type:        notifType,
+				Read:        item.Read,
+				ReferenceID: item.ReferenceID,
+				Source:      "general",
+				ImageURL:    item.ImageURL,
+				Severity:    item.Severity,
+			},
 		})
 	}
 
@@ -124,27 +135,30 @@ func (r *notificationRepository) GetNotifications(userID uuid.UUID) ([]domain.No
 		if item.PublicRelationID != nil {
 			refID = item.PublicRelationID.String()
 		}
-		results = append(results, domain.NotificationResponseItem{
-			ID:          item.ID.String(),
-			Title:       item.Title,
-			Description: item.Description,
-			Date:        item.CreatedDate.Format(time.RFC3339),
-			UpdatedDate: item.UpdatedDate.Format(time.RFC3339),
-			Type:        "news",
-			Read:        item.Read,
-			ReferenceID: refID,
-			Source:      "pao",
+		sortable = append(sortable, sortableNotification{
+			updatedTime: item.UpdatedDate,
+			item: domain.NotificationResponseItem{
+				ID:          item.ID.String(),
+				Title:       item.Title,
+				Description: item.Description,
+				Date:        item.CreatedDate.Format(time.RFC3339),
+				UpdatedDate: item.UpdatedDate.Format(time.RFC3339),
+				Type:        "news",
+				Read:        item.Read,
+				ReferenceID: refID,
+				Source:      "pao",
+			},
 		})
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		ti, errI := time.Parse(time.RFC3339, results[i].UpdatedDate)
-		tj, errJ := time.Parse(time.RFC3339, results[j].UpdatedDate)
-		if errI == nil && errJ == nil {
-			return ti.After(tj)
-		}
-		return results[i].UpdatedDate > results[j].UpdatedDate
+	sort.Slice(sortable, func(i, j int) bool {
+		return sortable[i].updatedTime.After(sortable[j].updatedTime)
 	})
+
+	results := make([]domain.NotificationResponseItem, len(sortable))
+	for i := range sortable {
+		results[i] = sortable[i].item
+	}
 
 	return results, nil
 }

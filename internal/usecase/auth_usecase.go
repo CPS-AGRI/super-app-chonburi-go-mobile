@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -27,6 +28,7 @@ import (
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
 	"super-app-chonburi-go-mobile/internal/infrastructure"
+	"super-app-chonburi-go-mobile/pkg/safe"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -105,24 +107,70 @@ type otpData struct {
 	Code      string    `json:"code"`
 	Ref       string    `json:"ref"`
 	ExpiresAt time.Time `json:"expires_at"`
+	Attempts  int       `json:"attempts"`
+}
+
+type pinAttemptEntry struct {
+	attempts  int
+	lockedAt  time.Time
+	expiresAt time.Time
 }
 
 type authUseCase struct {
-	repo        domain.AuthRepository
-	config      *config.Config
-	smsClient   infrastructure.SMSService
-	redisClient *infrastructure.RedisClient
-	otpStore    map[string]otpData
-	otpMu       sync.RWMutex
+	repo           domain.AuthRepository
+	config         *config.Config
+	smsClient      infrastructure.SMSService
+	redisClient    *infrastructure.RedisClient
+	otpStore       map[string]otpData
+	otpMu          sync.RWMutex
+	pinStore       map[string]pinAttemptEntry
+	pinMu          sync.Mutex
+	verifiedPhones map[string]time.Time
+	verifiedMu     sync.RWMutex
 }
 
 func NewAuthUseCase(repo domain.AuthRepository, cfg *config.Config, smsClient infrastructure.SMSService, redisClient *infrastructure.RedisClient) domain.AuthUseCase {
-	return &authUseCase{
-		repo:        repo,
-		config:      cfg,
-		smsClient:   smsClient,
-		redisClient: redisClient,
-		otpStore:    make(map[string]otpData),
+	uc := &authUseCase{
+		repo:           repo,
+		config:         cfg,
+		smsClient:      smsClient,
+		redisClient:    redisClient,
+		otpStore:       make(map[string]otpData),
+		pinStore:       make(map[string]pinAttemptEntry),
+		verifiedPhones: make(map[string]time.Time),
+	}
+	safe.Go(uc.cleanupLoop)
+	return uc
+}
+
+func (u *authUseCase) cleanupLoop() {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		u.otpMu.Lock()
+		for k, v := range u.otpStore {
+			if now.After(v.ExpiresAt) {
+				delete(u.otpStore, k)
+			}
+		}
+		u.otpMu.Unlock()
+
+		u.pinMu.Lock()
+		for k, v := range u.pinStore {
+			if now.After(v.expiresAt) {
+				delete(u.pinStore, k)
+			}
+		}
+		u.pinMu.Unlock()
+
+		u.verifiedMu.Lock()
+		for k, exp := range u.verifiedPhones {
+			if now.After(exp) {
+				delete(u.verifiedPhones, k)
+			}
+		}
+		u.verifiedMu.Unlock()
 	}
 }
 
@@ -199,8 +247,13 @@ func (u *authUseCase) LoginWithGoogle(tokenOrCode string, redirectURI ...string)
 
 	user, err := u.repo.GetByProviderID("google", googleID)
 	if err != nil {
-		user, err = u.repo.GetByEmail(email)
-		if err != nil {
+		if email != "" {
+			if existingByEmail, emailErr := u.repo.GetByEmail(email); emailErr == nil && existingByEmail != nil && existingByEmail.PinHash == "" && existingByEmail.PhoneNumber == "" {
+				user = existingByEmail
+				err = nil
+			}
+		}
+		if err != nil || user == nil {
 			user = &domain.AppUser{
 				ID:              uuid.New(),
 				PhoneNumber:     "",
@@ -400,7 +453,7 @@ func getFacebookPublicKey(kid string) (*rsa.PublicKey, error) {
 	return pubKey, nil
 }
 
-func verifyFacebookLimitedToken(authToken string) (*fbLimitedClaims, error) {
+func verifyFacebookLimitedToken(authToken string, expectedAppID ...string) (*fbLimitedClaims, error) {
 	claims := &fbLimitedClaims{}
 	token, err := jwt.ParseWithClaims(authToken, claims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
@@ -411,6 +464,21 @@ func verifyFacebookLimitedToken(authToken string) (*fbLimitedClaims, error) {
 	})
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("invalid facebook limited login token: %w", err)
+	}
+	if claims.Issuer != "" && claims.Issuer != "https://www.facebook.com" && claims.Issuer != "https://facebook.com" {
+		return nil, fmt.Errorf("invalid facebook token issuer: %s", claims.Issuer)
+	}
+	if len(expectedAppID) > 0 && expectedAppID[0] != "" {
+		matched := false
+		for _, aud := range claims.Audience {
+			if aud == expectedAppID[0] {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return nil, fmt.Errorf("facebook token audience mismatch: expected %s", expectedAppID[0])
+		}
 	}
 	return claims, nil
 }
@@ -497,7 +565,7 @@ func getApplePublicKey(kid string) (*rsa.PublicKey, error) {
 	return pubKey, nil
 }
 
-func verifyAppleIDToken(idToken string) (*appleClaims, error) {
+func verifyAppleIDToken(idToken string, expectedBundleID ...string) (*appleClaims, error) {
 	claims := &appleClaims{}
 	token, err := jwt.ParseWithClaims(idToken, claims, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {
@@ -514,11 +582,23 @@ func verifyAppleIDToken(idToken string) (*appleClaims, error) {
 		return nil, errors.New("invalid apple token issuer")
 	}
 
+	targetAud := "com.chonburipaoconnext.mobile"
+	if len(expectedBundleID) > 0 && expectedBundleID[0] != "" {
+		targetAud = expectedBundleID[0]
+	}
+	if claims.Aud != "" && claims.Aud != targetAud {
+		return nil, fmt.Errorf("apple token audience mismatch: expected %s, got %s", targetAud, claims.Aud)
+	}
+
 	return claims, nil
 }
 
 func (u *authUseCase) LoginWithFacebookLimited(authToken string) (*domain.AuthResponse, error) {
-	claims, err := verifyFacebookLimitedToken(authToken)
+	var fbAppID string
+	if u.config != nil {
+		fbAppID = u.config.FacebookAppID
+	}
+	claims, err := verifyFacebookLimitedToken(authToken, fbAppID)
 	if err != nil {
 		return nil, err
 	}
@@ -540,7 +620,10 @@ func (u *authUseCase) LoginWithFacebookLimited(authToken string) (*domain.AuthRe
 	user, err := u.repo.GetByProviderID("facebook", fbUserID)
 	if err != nil {
 		if fbEmail != "" {
-			user, err = u.repo.GetByEmail(fbEmail)
+			if existingByEmail, emailErr := u.repo.GetByEmail(fbEmail); emailErr == nil && existingByEmail != nil && existingByEmail.PinHash == "" && existingByEmail.PhoneNumber == "" {
+				user = existingByEmail
+				err = nil
+			}
 		}
 		if err != nil || user == nil {
 			newUserID := uuid.New()
@@ -633,6 +716,146 @@ func (u *authUseCase) LoginWithFacebookLimited(authToken string) (*domain.AuthRe
 
 // --- End Facebook Limited Login ---
 
+func (u *authUseCase) LoginWithApple(idToken string, fullName string) (*domain.AuthResponse, error) {
+	var appleBundleID string
+	if u.config != nil {
+		appleBundleID = u.config.AppleBundleID
+	}
+	claims, err := verifyAppleIDToken(idToken, appleBundleID)
+	if err != nil {
+		return nil, err
+	}
+	if claims.Sub == "" {
+		return nil, errors.New("apple profile id (sub) is empty")
+	}
+
+	displayName := strings.TrimSpace(fullName)
+	if displayName == "" {
+		displayName = "Apple User"
+	}
+
+	rawBytes, _ := json.Marshal(claims)
+	rawDataStr := string(rawBytes)
+
+	user, err := u.repo.GetByProviderID("apple", claims.Sub)
+	if err != nil {
+		if claims.Email != "" {
+			if existingByEmail, emailErr := u.repo.GetByEmail(claims.Email); emailErr == nil && existingByEmail != nil && existingByEmail.PinHash == "" && existingByEmail.PhoneNumber == "" {
+				user = existingByEmail
+				err = nil
+			}
+		}
+		if err != nil || user == nil {
+			newUserID := uuid.New()
+			firstName := displayName
+			lastName := ""
+			if strings.EqualFold(displayName, "Apple User") {
+				firstName = "ผู้ใช้งาน"
+				lastName = "Apple"
+			} else {
+				for i, ch := range displayName {
+					if ch == ' ' {
+						firstName = displayName[:i]
+						lastName = strings.TrimSpace(displayName[i+1:])
+						break
+					}
+				}
+			}
+			user = &domain.AppUser{
+				ID:          newUserID,
+				PhoneNumber: "",
+				IsConsent:   true,
+				CreatedBy:   "system",
+				CreatedDate: time.Now(),
+				UpdatedBy:   "system",
+				UpdatedDate: time.Now(),
+				OauthAccounts: []domain.UserOauthAccount{
+					{
+						ID:          uuid.New(),
+						Provider:    "apple",
+						ProviderId:  claims.Sub,
+						Email:       claims.Email,
+						DisplayName: displayName,
+						RawData:     rawDataStr,
+						CreatedAt:   time.Now(),
+					},
+				},
+				Information: &domain.UserInformation{
+					UserId:             newUserID,
+					Name:               firstName,
+					LastName:           lastName,
+					Phone:              "",
+					Status:             "active",
+					VerificationStatus: "unverified",
+					IsConsent:          true,
+					CreatedBy:          "system",
+					CreatedDate:        time.Now(),
+					UpdatedDate:        time.Now(),
+				},
+			}
+			if claims.Email != "" {
+				user.Email = &claims.Email
+				user.Information.Email = &claims.Email
+			}
+			if err = u.repo.Create(user); err != nil {
+				return nil, err
+			}
+		} else {
+			oauthAcc := &domain.UserOauthAccount{
+				ID:          uuid.New(),
+				UserId:      user.ID,
+				Provider:    "apple",
+				ProviderId:  claims.Sub,
+				Email:       claims.Email,
+				DisplayName: displayName,
+				RawData:     rawDataStr,
+				CreatedAt:   time.Now(),
+			}
+			if err = u.repo.CreateOauthAccount(oauthAcc); err != nil {
+				return nil, err
+			}
+			user.OauthAccounts = append(user.OauthAccounts, *oauthAcc)
+		}
+	}
+
+	// Update existing user's placeholder name if Apple returned a real fullName
+	if user != nil && user.Information != nil && displayName != "" && !strings.EqualFold(displayName, "Apple User") && isPlaceholderName(user.Information.Name) {
+		firstName := displayName
+		lastName := ""
+		for i, ch := range displayName {
+			if ch == ' ' {
+				firstName = displayName[:i]
+				lastName = strings.TrimSpace(displayName[i+1:])
+				break
+			}
+		}
+		user.Information.Name = firstName
+		if lastName != "" || isPlaceholderLastName(user.Information.LastName) {
+			user.Information.LastName = lastName
+		}
+		user.UpdatedDate = time.Now()
+		user.Information.UpdatedDate = time.Now()
+		_ = u.repo.Update(user)
+	}
+
+	accessTokenJWT, err := u.generateAccessToken(user)
+	if err != nil {
+		return nil, err
+	}
+	refreshTokenJWT, err := u.generateRefreshToken(user)
+	if err != nil {
+		return nil, err
+	}
+	if fullUser, err := u.repo.GetByID(user.ID); err == nil && fullUser != nil {
+		user = fullUser
+	}
+	return &domain.AuthResponse{
+		AccessToken:  accessTokenJWT,
+		RefreshToken: refreshTokenJWT,
+		User:         user,
+	}, nil
+}
+
 func (u *authUseCase) LoginWithFacebook(accessToken string) (*domain.AuthResponse, error) {
 	// Call Facebook Graph API to verify token and retrieve profile info
 	resp, err := oauthHTTPClient.Get(fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", accessToken))
@@ -675,9 +898,12 @@ func (u *authUseCase) LoginWithFacebook(accessToken string) (*domain.AuthRespons
 	// 1. Check if user already has this Facebook account linked
 	user, err := u.repo.GetByProviderID("facebook", fbProfile.ID)
 	if err != nil {
-		// Not found by provider, try finding by email if it exists
+		// Not found by provider, try finding by email only if unlinked OAuth-only account
 		if fbProfile.Email != "" {
-			user, err = u.repo.GetByEmail(fbProfile.Email)
+			if existingByEmail, emailErr := u.repo.GetByEmail(fbProfile.Email); emailErr == nil && existingByEmail != nil && existingByEmail.PinHash == "" && existingByEmail.PhoneNumber == "" {
+				user = existingByEmail
+				err = nil
+			}
 		}
 
 		if err != nil || user == nil {
@@ -816,8 +1042,45 @@ func (u *authUseCase) LoginWithFacebook(accessToken string) (*domain.AuthRespons
 	}, nil
 }
 
+func (u *authUseCase) verifyLineAccessToken(accessToken string) error {
+	verifyURL := fmt.Sprintf("https://api.line.me/oauth2/v2.1/verify?access_token=%s", url.QueryEscape(accessToken))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, verifyURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create line verify request: %w", err)
+	}
+
+	resp, err := oauthHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to verify line access token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("invalid line access token (status %d)", resp.StatusCode)
+	}
+
+	var verifyResult struct {
+		ClientID  string `json:"client_id"`
+		ExpiresIn int64  `json:"expires_in"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&verifyResult); err != nil {
+		return fmt.Errorf("failed to parse line verify response: %w", err)
+	}
+	if verifyResult.ExpiresIn <= 0 {
+		return errors.New("line access token has expired")
+	}
+	if u.config != nil && u.config.LineChannelID != "" && verifyResult.ClientID != u.config.LineChannelID {
+		return fmt.Errorf("line token channel mismatch: expected %s, got %s", u.config.LineChannelID, verifyResult.ClientID)
+	}
+	return nil
+}
+
 func (u *authUseCase) LoginWithLine(codeOrToken string, redirectURI string) (*domain.AuthResponse, error) {
 	lineAccessToken := codeOrToken
+	exchangedFromCode := false
 
 	// Check if codeOrToken is an authorization code that needs exchange
 	if len(codeOrToken) < 60 || strings.Contains(codeOrToken, "-") == false {
@@ -838,9 +1101,16 @@ func (u *authUseCase) LoginWithLine(codeOrToken string, redirectURI string) (*do
 				}
 				if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err == nil && tokenResult.AccessToken != "" {
 					lineAccessToken = tokenResult.AccessToken
+					exchangedFromCode = true
 				}
 				tokenResp.Body.Close()
 			}
+		}
+	}
+
+	if !exchangedFromCode {
+		if err := u.verifyLineAccessToken(lineAccessToken); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1022,14 +1292,29 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 	// Acquire Redis Distributed Lock for the target PID to prevent race conditions
 	if u.redisClient != nil {
 		lockKey := fmt.Sprintf("lock:thaiid:%s", pid)
-		acquired, err := u.redisClient.AcquireLock(context.Background(), lockKey, 10*time.Second)
-		if err == nil && acquired {
-			defer u.redisClient.ReleaseLock(context.Background(), lockKey)
+		lockOwner := uuid.New().String()
+		acquired := false
+		for attempt := 0; attempt < 4; attempt++ {
+			ok, lockErr := u.redisClient.AcquireLockWithValue(context.Background(), lockKey, lockOwner, 10*time.Second)
+			if lockErr != nil {
+				// Redis connection failure: proceed only if Redis itself errored out
+				acquired = true
+				break
+			}
+			if ok {
+				acquired = true
+				defer u.redisClient.ReleaseLockWithValue(context.Background(), lockKey, lockOwner)
+				break
+			}
+			time.Sleep(150 * time.Millisecond)
+		}
+		if !acquired {
+			return nil, errors.New("ระบบกำลังดำเนินการยืนยันตัวตน ThaID กรุณารอสักครู่แล้วลองใหม่อีกครั้ง")
 		}
 	}
 
 	// 3. Match or register user based on HMAC hash of pid (not raw pid)
-	pidHash := hmacSHA256(pid, u.config.PIDHmacSecret)
+	pidHash := u.hashPID(pid)
 	user, err := u.repo.GetByProviderID("thaiid", pidHash)
 	if err != nil {
 		// Not found: Create a brand new user
@@ -1073,8 +1358,8 @@ func (u *authUseCase) LoginWithThaiID(code string, redirectURI string) (*domain.
 		houseNumber, villageNumber, alley, road, subdistrict, district, province, postalCode := parseThaiIDAddress(thaiIDProfile)
 
 		// Secure hash and encrypt PID — PDPA compliance
-		identityHash := hmacSHA256(pid, u.config.PIDHmacSecret)
-		identityEncrypted, err := encryptAES256GCM(pid, u.config.PIDEncryptionKey)
+		identityHash := u.hashPID(pid)
+		identityEncrypted, err := u.encryptPID(pid)
 		if err != nil {
 			log.Printf("[ThaiID Error] Failed to encrypt PID: %v", err)
 			return nil, fmt.Errorf("failed to secure identity number: %w", err)
@@ -1212,6 +1497,13 @@ func (u *authUseCase) RefreshToken(refreshToken string) (*domain.AuthResponse, e
 		return nil, errors.New("invalid token claims")
 	}
 
+	if tokenType, ok := claims["token_type"].(string); ok && strings.EqualFold(tokenType, "access") {
+		return nil, errors.New("access token cannot be used as refresh token")
+	}
+	if purpose, ok := claims["purpose"].(string); ok && purpose != "" {
+		return nil, errors.New("invalid token purpose for refresh")
+	}
+
 	userIDStr, ok := claims["user_id"].(string)
 	if !ok || userIDStr == "" {
 		return nil, errors.New("user_id not found in token")
@@ -1225,6 +1517,10 @@ func (u *authUseCase) RefreshToken(refreshToken string) (*domain.AuthResponse, e
 	user, err := u.repo.GetByID(userID)
 	if err != nil || user == nil {
 		return nil, errors.New("user not found")
+	}
+
+	if strings.HasPrefix(user.PhoneNumber, "DELETED_") || (user.Information != nil && (strings.EqualFold(user.Information.Status, "inactive") || strings.EqualFold(user.Information.Status, "deleted"))) {
+		return nil, errors.New("account has been deactivated")
 	}
 
 	newAccessToken, err := u.generateAccessToken(user)
@@ -1251,9 +1547,10 @@ func (u *authUseCase) generateAccessToken(user *domain.AppUser) (string, error) 
 	}
 
 	claims := jwt.MapClaims{
-		"user_id": user.ID.String(),
-		"email":   email,
-		"exp":     time.Now().Add(time.Hour * 2).Unix(),
+		"user_id":    user.ID.String(),
+		"email":      email,
+		"token_type": "access",
+		"exp":        time.Now().Add(time.Hour * 2).Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(u.config.JWTSecret))
@@ -1261,8 +1558,9 @@ func (u *authUseCase) generateAccessToken(user *domain.AppUser) (string, error) 
 
 func (u *authUseCase) generateRefreshToken(user *domain.AppUser) (string, error) {
 	claims := jwt.MapClaims{
-		"user_id": user.ID.String(),
-		"exp":     time.Now().Add(time.Hour * 24 * 30).Unix(),
+		"user_id":    user.ID.String(),
+		"token_type": "refresh",
+		"exp":        time.Now().Add(time.Hour * 24 * 30).Unix(),
 	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(u.config.JWTSecret))
@@ -1273,6 +1571,12 @@ func stringPtr(s string) *string {
 }
 
 func (u *authUseCase) RequestOTP(phoneNumber string) (*domain.OTPRequestResponse, error) {
+	cleanPhone, err := infrastructure.NormalizeThaiMobile(phoneNumber)
+	if err != nil {
+		return nil, err
+	}
+	phoneNumber = cleanPhone
+
 	// Rate limiting / Cooldown check (60s)
 	cooldownKey := fmt.Sprintf("otp:cooldown:%s", phoneNumber)
 	otpKey := fmt.Sprintf("otp:%s", phoneNumber)
@@ -1324,24 +1628,48 @@ func (u *authUseCase) RequestOTP(phoneNumber string) (*domain.OTPRequestResponse
 		u.otpMu.Unlock()
 	}
 
-	// พิมพ์รหัสออกหน้าจอ console เพื่อการทดสอบใน local dev
-	log.Printf("📱 [OTP Debug] Phone: %s -> OTP: %s, Ref: %s (Expires in 5m)", phoneNumber, otpCode, ref)
+	allowDebugOTP := u.config == nil || u.config.AppEnv == "" || (strings.EqualFold(u.config.AppEnv, "local_dev") && u.config.AllowDebugOTP)
+	if !allowDebugOTP {
+		log.Printf("📱 [OTP Requested] Phone: %s -> Ref: %s (Expires in 5m)", infrastructure.MaskPhone(phoneNumber), ref)
+	} else {
+		log.Printf("📱 [OTP Debug] Phone: %s -> OTP: %s, Ref: %s (Expires in 5m)", phoneNumber, otpCode, ref)
+	}
 
-	// หากมีการตั้งค่า SMS Service ให้ยิงส่ง SMS จริงไปยัง Gateway / Server ปลายทาง
+	// ส่ง SMS จริงไปยัง Gateway / Fallback Relay (ล้มเหลวต้องคืน error และปลด cooldown)
 	if u.smsClient != nil {
-		if err := u.smsClient.SendOTP(context.Background(), phoneNumber, otpCode, ref); err != nil {
-			log.Printf("⚠️ [SMS Gateway Warning] Failed to send SMS via Gateway: %v", err)
+		smsCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := u.smsClient.SendOTP(smsCtx, phoneNumber, otpCode, ref)
+		cancel()
+		if err != nil {
+			if u.redisClient != nil {
+				_ = u.redisClient.Delete(ctx, otpKey)
+				_ = u.redisClient.ReleaseLock(ctx, cooldownKey)
+			}
+			u.otpMu.Lock()
+			delete(u.otpStore, phoneNumber)
+			u.otpMu.Unlock()
+			log.Printf("⚠️ [SMS Gateway Error] Failed to send OTP to %s (Ref: %s): %v", infrastructure.MaskPhone(phoneNumber), ref, err)
+			return nil, fmt.Errorf("ไม่สามารถส่งรหัส OTP ทาง SMS ได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง: %w", err)
 		}
+	}
+
+	responseOTP := ""
+	if allowDebugOTP {
+		responseOTP = otpCode
 	}
 
 	return &domain.OTPRequestResponse{
 		Success: true,
 		Ref:     ref,
-		OTP:     otpCode, // แนบไปให้หน้าบ้านหยิบใช้งานได้ทันทีในโหมด dev
+		OTP:     responseOTP,
 	}, nil
 }
 
-func (u *authUseCase) VerifyOTP(phoneNumber, otp, ref string) (*domain.OTPVerifyResponse, error) {
+func (u *authUseCase) verifyAndConsumeOTP(phoneNumber, otp, ref string) error {
+	if strings.TrimSpace(otp) == "" || strings.TrimSpace(ref) == "" {
+		return errors.New("กรุณาระบุรหัส OTP")
+	}
+
 	var stored otpData
 	found := false
 	ctx := context.Background()
@@ -1364,7 +1692,7 @@ func (u *authUseCase) VerifyOTP(phoneNumber, otp, ref string) (*domain.OTPVerify
 	}
 
 	if !found {
-		return nil, errors.New("OTP verification code not found or expired")
+		return errors.New("OTP verification code not found or expired")
 	}
 
 	if time.Now().After(stored.ExpiresAt) {
@@ -1374,47 +1702,136 @@ func (u *authUseCase) VerifyOTP(phoneNumber, otp, ref string) (*domain.OTPVerify
 		u.otpMu.Lock()
 		delete(u.otpStore, phoneNumber)
 		u.otpMu.Unlock()
-		return nil, errors.New("OTP code has expired")
+		return errors.New("OTP code has expired")
 	}
 
-	if stored.Code != otp || stored.Ref != ref {
-		return nil, errors.New("invalid OTP code or reference")
+	otpAttemptsKey := fmt.Sprintf("auth:otp_attempts:%s", phoneNumber)
+	codeMatch := subtle.ConstantTimeCompare([]byte(stored.Code), []byte(otp)) == 1
+	refMatch := subtle.ConstantTimeCompare([]byte(stored.Ref), []byte(ref)) == 1
+
+	if !codeMatch || !refMatch {
+		var attempts int64
+		if u.redisClient != nil && u.redisClient.Raw() != nil {
+			attempts = u.redisClient.Raw().Incr(ctx, otpAttemptsKey).Val()
+			u.redisClient.Raw().Expire(ctx, otpAttemptsKey, 5*time.Minute)
+		} else {
+			u.otpMu.Lock()
+			if cur, exists := u.otpStore[phoneNumber]; exists {
+				cur.Attempts++
+				u.otpStore[phoneNumber] = cur
+				attempts = int64(cur.Attempts)
+			} else {
+				attempts = 1
+			}
+			u.otpMu.Unlock()
+		}
+		if attempts >= 3 {
+			if u.redisClient != nil {
+				_ = u.redisClient.Delete(ctx, otpKey, otpAttemptsKey)
+			}
+			u.otpMu.Lock()
+			delete(u.otpStore, phoneNumber)
+			u.otpMu.Unlock()
+			return errors.New("รหัส OTP ไม่ถูกต้องเกิน 3 ครั้ง รหัสหมดอายุ กรุณาขอรหัส OTP ใหม่")
+		}
+		return fmt.Errorf("รหัส OTP หรือเลขอ้างอิงไม่ถูกต้อง (เหลือโอกาสอีก %d ครั้ง)", 3-attempts)
 	}
 
 	// ลบ OTP ออกจาก store เมื่อตรวจสอบผ่านสำเร็จ 100%
 	if u.redisClient != nil {
-		_ = u.redisClient.Delete(ctx, otpKey)
+		_ = u.redisClient.Delete(ctx, otpKey, otpAttemptsKey)
 	}
 	u.otpMu.Lock()
 	delete(u.otpStore, phoneNumber)
 	u.otpMu.Unlock()
+	return nil
+}
 
-	// ตรวจสอบสถานะการมีอยู่ของผู้ใช้งานด้วยเบอร์โทรศัพท์
-	_, err := u.repo.GetByPhoneNumber(phoneNumber)
-	if err != nil {
-		// ไม่มีผู้ใช้ในระบบ -> คืนค่า false เพื่อให้ข้ามไปตั้ง PIN และลงทะเบียน
-		// ทำการออก temp_token (JWT) เพื่อป้องกันการสวมสิทธิ์ในหน้า register
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"phone_number": phoneNumber,
-			"exp":          time.Now().Add(15 * time.Minute).Unix(),
-			"purpose":      "registration",
-		})
-		tempToken, err := token.SignedString([]byte(u.config.JWTSecret))
-		if err != nil {
-			return nil, err
-		}
+func normalizePhoneNumber(phoneNumber string) string {
+	trimmed := strings.TrimSpace(phoneNumber)
+	if cleanPhone, err := infrastructure.NormalizeThaiMobile(trimmed); err == nil && cleanPhone != "" {
+		return cleanPhone
+	}
+	return trimmed
+}
 
-		return &domain.OTPVerifyResponse{
-			Success:      true,
-			IsRegistered: false,
-			TempToken:    tempToken,
-		}, nil
+func (u *authUseCase) storeVerifiedPhoneMarker(phoneNumber, ref string) {
+	norm := normalizePhoneNumber(phoneNumber)
+	if norm == "" {
+		return
+	}
+	u.verifiedMu.Lock()
+	u.verifiedPhones[norm] = time.Now().Add(10 * time.Minute)
+	u.verifiedMu.Unlock()
+
+	if u.redisClient != nil {
+		_ = u.redisClient.SetJSON(context.Background(), "otp_verified:"+norm, map[string]string{"ref": ref}, 10*time.Minute)
+	}
+}
+
+func (u *authUseCase) hasVerifiedPhoneMarker(phoneNumber string) bool {
+	norm := normalizePhoneNumber(phoneNumber)
+	if norm == "" {
+		return false
+	}
+	u.verifiedMu.RLock()
+	exp, exists := u.verifiedPhones[norm]
+	u.verifiedMu.RUnlock()
+	if exists && time.Now().Before(exp) {
+		return true
 	}
 
-	// มีผู้ใช้ในระบบแล้ว -> ส่งผลลัพธ์กลับเพื่อให้ไปหน้ากรอก PIN
+	if u.redisClient != nil {
+		var marker map[string]string
+		if err := u.redisClient.GetJSON(context.Background(), "otp_verified:"+norm, &marker); err == nil && len(marker) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *authUseCase) consumeVerifiedPhoneMarker(phoneNumber string) {
+	norm := normalizePhoneNumber(phoneNumber)
+	if norm == "" {
+		return
+	}
+	u.verifiedMu.Lock()
+	delete(u.verifiedPhones, norm)
+	u.verifiedMu.Unlock()
+
+	if u.redisClient != nil {
+		_ = u.redisClient.Delete(context.Background(), "otp_verified:"+norm)
+	}
+}
+
+func (u *authUseCase) VerifyOTP(phoneNumber, otp, ref string) (*domain.OTPVerifyResponse, error) {
+	phoneNumber = normalizePhoneNumber(phoneNumber)
+	if err := u.verifyAndConsumeOTP(phoneNumber, otp, ref); err != nil {
+		return nil, err
+	}
+
+	// บันทึกสถานะว่าเบอร์โทรศัพท์นี้ผ่านการยืนยัน OTP แล้ว (มีอายุ 10 นาที สำหรับการผูกเบอร์ OAuth หรือตั้งรหัส PIN ใหม่)
+	u.storeVerifiedPhoneMarker(phoneNumber, ref)
+
+	// ออก temp_token (JWT) ทั้งกรณีผู้ใช้ใหม่ (register) และผู้ใช้เดิม (reset_pin)
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"phone_number": phoneNumber,
+		"exp":          time.Now().Add(15 * time.Minute).Unix(),
+		"purpose":      "registration",
+	})
+	tempToken, err := token.SignedString([]byte(u.config.JWTSecret))
+	if err != nil {
+		return nil, err
+	}
+
+	// ตรวจสอบสถานะการมีอยู่ของผู้ใช้งานด้วยเบอร์โทรศัพท์
+	_, err = u.repo.GetByPhoneNumber(phoneNumber)
+	isRegistered := err == nil
+
 	return &domain.OTPVerifyResponse{
 		Success:      true,
-		IsRegistered: true,
+		IsRegistered: isRegistered,
+		TempToken:    tempToken,
 	}, nil
 }
 
@@ -1529,9 +1946,11 @@ func (u *authUseCase) Register(req domain.RegisterRequest) (*domain.AuthResponse
 		},
 	}
 
-	if req.Email != "" {
-		user.Email = &req.Email
-		user.Information.Email = &req.Email
+	if emailTrimmed := strings.TrimSpace(req.Email); emailTrimmed != "" {
+		emailHash := hashValue(strings.ToLower(emailTrimmed))
+		user.Email = &emailTrimmed
+		user.EmailHash = &emailHash
+		user.Information.Email = &emailTrimmed
 	}
 
 	// สร้างผู้ใช้ในฐานข้อมูล
@@ -1556,16 +1975,85 @@ func (u *authUseCase) Register(req domain.RegisterRequest) (*domain.AuthResponse
 	}, nil
 }
 
+func (u *authUseCase) verifyPinWithLockout(phoneNumber, pinHash, pin string) error {
+	ctx := context.Background()
+	lockoutKey := fmt.Sprintf("auth:pin_lockout:%s", phoneNumber)
+	attemptsKey := fmt.Sprintf("auth:pin_attempts:%s", phoneNumber)
+
+	if u.redisClient != nil && u.redisClient.Raw() != nil {
+		if ttl := u.redisClient.Raw().TTL(ctx, lockoutKey).Val(); ttl > 0 {
+			mins := int(ttl.Minutes()) + 1
+			return fmt.Errorf("บัญชีถูกระงับชั่วคราวเนื่องจากใส่ PIN ผิดเกินกำหนด กรุณาลองใหม่ในอีก %d นาที", mins)
+		}
+	} else {
+		u.pinMu.Lock()
+		entry, exists := u.pinStore[phoneNumber]
+		if exists && !entry.lockedAt.IsZero() && time.Now().Before(entry.expiresAt) {
+			mins := int(time.Until(entry.expiresAt).Minutes()) + 1
+			u.pinMu.Unlock()
+			return fmt.Errorf("บัญชีถูกระงับชั่วคราวเนื่องจากใส่ PIN ผิดเกินกำหนด กรุณาลองใหม่ในอีก %d นาที", mins)
+		}
+		u.pinMu.Unlock()
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(pinHash), []byte(pin)); err != nil {
+		if u.redisClient != nil && u.redisClient.Raw() != nil {
+			attempts := u.redisClient.Raw().Incr(ctx, attemptsKey).Val()
+			u.redisClient.Raw().Expire(ctx, attemptsKey, 15*time.Minute)
+
+			if attempts >= 5 {
+				u.redisClient.Raw().Set(ctx, lockoutKey, "locked", 15*time.Minute)
+				u.redisClient.Raw().Del(ctx, attemptsKey)
+				return errors.New("ใส่ PIN ไม่ถูกต้องเกิน 5 ครั้ง บัญชีถูกระงับชั่วคราว 15 นาที")
+			}
+			return fmt.Errorf("รหัส PIN ไม่ถูกต้อง (เหลือโอกาสอีก %d ครั้ง)", 5-attempts)
+		}
+
+		u.pinMu.Lock()
+		entry := u.pinStore[phoneNumber]
+		if time.Now().After(entry.expiresAt) {
+			entry = pinAttemptEntry{}
+		}
+		entry.attempts++
+		entry.expiresAt = time.Now().Add(15 * time.Minute)
+		if entry.attempts >= 5 {
+			entry.lockedAt = time.Now()
+			u.pinStore[phoneNumber] = entry
+			u.pinMu.Unlock()
+			return errors.New("ใส่ PIN ไม่ถูกต้องเกิน 5 ครั้ง บัญชีถูกระงับชั่วคราว 15 นาที")
+		}
+		u.pinStore[phoneNumber] = entry
+		remaining := 5 - entry.attempts
+		u.pinMu.Unlock()
+		return fmt.Errorf("รหัส PIN ไม่ถูกต้อง (เหลือโอกาสอีก %d ครั้ง)", remaining)
+	}
+
+	if u.redisClient != nil && u.redisClient.Raw() != nil {
+		_ = u.redisClient.Raw().Del(ctx, attemptsKey, lockoutKey)
+	} else {
+		u.pinMu.Lock()
+		delete(u.pinStore, phoneNumber)
+		u.pinMu.Unlock()
+	}
+	return nil
+}
+
 func (u *authUseCase) LoginWithPin(phoneNumber, pin string) (*domain.AuthResponse, error) {
+	if cleanPhone, err := infrastructure.NormalizeThaiMobile(phoneNumber); err == nil {
+		phoneNumber = cleanPhone
+	}
+
 	user, err := u.repo.GetByPhoneNumber(phoneNumber)
-	if err != nil {
+	if err != nil || user == nil {
 		return nil, errors.New("invalid phone number or PIN")
 	}
 
-	// ตรวจสอบ PIN
-	err = bcrypt.CompareHashAndPassword([]byte(user.PinHash), []byte(pin))
-	if err != nil {
-		return nil, errors.New("invalid phone number or PIN")
+	if strings.HasPrefix(user.PhoneNumber, "DELETED_") || (user.Information != nil && (strings.EqualFold(user.Information.Status, "inactive") || strings.EqualFold(user.Information.Status, "deleted"))) {
+		return nil, errors.New("บัญชีนี้ถูกยกเลิกการใช้งานแล้ว")
+	}
+
+	if err := u.verifyPinWithLockout(phoneNumber, user.PinHash, pin); err != nil {
+		return nil, err
 	}
 
 	accessToken, err := u.generateAccessToken(user)
@@ -1778,6 +2266,40 @@ func parseThaiIDAddress(thaiIDProfile map[string]interface{}) (houseNumber, vill
 	return
 }
 
+func (u *authUseCase) getPIDHmacSecret() string {
+	if u.config != nil && u.config.PIDHmacSecret != "" {
+		return u.config.PIDHmacSecret
+	}
+	seed := "default-fallback-secret"
+	if u.config != nil && u.config.JWTSecret != "" {
+		seed = u.config.JWTSecret
+	}
+	sum := sha256.Sum256([]byte(seed + ":pid_hmac_secret"))
+	return hex.EncodeToString(sum[:])
+}
+
+func (u *authUseCase) getPIDEncryptionKey() string {
+	if u.config != nil && len(u.config.PIDEncryptionKey) == 64 {
+		if b, err := hex.DecodeString(u.config.PIDEncryptionKey); err == nil && len(b) == 32 {
+			return u.config.PIDEncryptionKey
+		}
+	}
+	seed := "default-fallback-secret"
+	if u.config != nil && u.config.JWTSecret != "" {
+		seed = u.config.JWTSecret
+	}
+	sum := sha256.Sum256([]byte(seed + ":pid_encryption_key"))
+	return hex.EncodeToString(sum[:])
+}
+
+func (u *authUseCase) hashPID(pid string) string {
+	return hmacSHA256(pid, u.getPIDHmacSecret())
+}
+
+func (u *authUseCase) encryptPID(pid string) (string, error) {
+	return encryptAES256GCM(pid, u.getPIDEncryptionKey())
+}
+
 // encryptAES256GCM encrypts plaintext using AES-256-GCM with a random 12-byte nonce.
 // keyHex must be a 64-character hex string (32 bytes = 256-bit key).
 // Returns base64(nonce + ciphertext) for storage.
@@ -1802,23 +2324,34 @@ func encryptAES256GCM(plaintext, keyHex string) (string, error) {
 	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
+func isUnlinkedOAuthPhone(phone string) bool {
+	return phone == "" ||
+		strings.HasPrefix(phone, "G_") ||
+		strings.HasPrefix(phone, "FB_") ||
+		strings.HasPrefix(phone, "LINE_") ||
+		strings.HasPrefix(phone, "AP_") ||
+		strings.HasPrefix(phone, "TH_")
+}
+
 func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin string) (*domain.AuthResponse, error) {
-	// 1. ตรวจสอบรหัส OTP และ Ref Code (หากยังค้างอยู่ใน Store)
-	if otp != "" && ref != "" {
-		u.otpMu.Lock()
-		stored, exists := u.otpStore[phoneNumber]
-		if exists {
-			delete(u.otpStore, phoneNumber)
-			if time.Now().After(stored.ExpiresAt) {
-				u.otpMu.Unlock()
-				return nil, errors.New("OTP code has expired")
-			}
-			if stored.Code != otp || stored.Ref != ref {
-				u.otpMu.Unlock()
-				return nil, errors.New("invalid OTP code or reference")
-			}
+	phoneNumber = normalizePhoneNumber(phoneNumber)
+
+	// 1. ตรวจสอบว่าเบอร์โทรศัพท์นี้ผ่านการยืนยัน OTP แล้ว (จาก VerifyOTP ในช่วง 10 นาที หรือส่ง OTP/Ref มาตรวจสอบโดยตรง)
+	otpVerified := false
+	if strings.TrimSpace(otp) != "" && strings.TrimSpace(ref) != "" {
+		if err := u.verifyAndConsumeOTP(phoneNumber, otp, ref); err == nil {
+			otpVerified = true
+		} else if u.hasVerifiedPhoneMarker(phoneNumber) {
+			otpVerified = true
+		} else {
+			return nil, err
 		}
-		u.otpMu.Unlock()
+	} else if u.hasVerifiedPhoneMarker(phoneNumber) {
+		otpVerified = true
+	}
+
+	if !otpVerified {
+		return nil, errors.New("กรุณาระบุรหัส OTP")
 	}
 
 	// 2. ตรวจสอบ Token เพื่อดึง oauthID จาก Provider
@@ -1827,10 +2360,14 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 
 	switch providerLower {
 	case "facebook":
-		if claims, err := verifyFacebookLimitedToken(idToken); err == nil && claims.Sub != "" {
+		fbAppID := ""
+		if u.config != nil {
+			fbAppID = u.config.FacebookAppID
+		}
+		if claims, err := verifyFacebookLimitedToken(idToken, fbAppID); err == nil && claims.Sub != "" {
 			oauthID = claims.Sub
 		} else {
-			fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id&access_token=%s", idToken)
+			fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id&access_token=%s", url.QueryEscape(idToken))
 			fbReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fbURL, nil)
 			if err == nil {
 				if resp, err := oauthHTTPClient.Do(fbReq); err == nil && resp.StatusCode == http.StatusOK {
@@ -1844,44 +2381,52 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 			}
 		}
 	case "line":
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://api.line.me/v2/profile", nil)
-		if err == nil {
-			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", idToken))
-			if resp, err := oauthHTTPClient.Do(req); err == nil && resp.StatusCode == http.StatusOK {
-				var lineProfile struct {
-					UserID string `json:"userId"`
+		if err := u.verifyLineAccessToken(idToken); err == nil {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://api.line.me/v2/profile", nil)
+			if err == nil {
+				req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", idToken))
+				if resp, err := oauthHTTPClient.Do(req); err == nil && resp.StatusCode == http.StatusOK {
+					var lineProfile struct {
+						UserID string `json:"userId"`
+					}
+					_ = json.NewDecoder(resp.Body).Decode(&lineProfile)
+					resp.Body.Close()
+					oauthID = lineProfile.UserID
 				}
-				_ = json.NewDecoder(resp.Body).Decode(&lineProfile)
-				resp.Body.Close()
-				oauthID = lineProfile.UserID
 			}
 		}
 	case "apple":
-		if claims, err := verifyAppleIDToken(idToken); err == nil && claims.Sub != "" {
+		appleBundleID := ""
+		if u.config != nil {
+			appleBundleID = u.config.AppleBundleID
+		}
+		if claims, err := verifyAppleIDToken(idToken, appleBundleID); err == nil && claims.Sub != "" {
 			oauthID = claims.Sub
 		}
 	case "thaiid":
 		oauthID = idToken
 	default: // google
-		if sub, _, _, _, _, err := verifyGoogleIDToken(idToken, u.config.GoogleClientID); err == nil {
+		googleClientID := ""
+		if u.config != nil {
+			googleClientID = u.config.GoogleClientID
+		}
+		if sub, _, _, _, _, err := verifyGoogleIDToken(idToken, googleClientID); err == nil {
 			oauthID = sub
 		}
 	}
 
-	// ค้นหาบัญชีชั่วคราวจาก oauthID หรือ idToken ที่เป็น UUID
+	// ค้นหาบัญชีชั่วคราวจาก oauthID หรือ oauth_profile_id ใน user_oauth_accounts เท่านั้น (ห้ามใช้ GetByID โดยตรงเพื่อป้องกันการปลอมแปลง user_id)
 	var tempUser *domain.AppUser
-	var err error
 	if oauthID != "" {
-		tempUser, err = u.repo.GetByProviderID(providerLower, oauthID)
-	}
-	if tempUser == nil {
-		if parsedID, parseErr := uuid.Parse(oauthID); parseErr == nil {
-			tempUser, err = u.repo.GetByID(parsedID)
+		if candidate, err := u.repo.GetByProviderID(providerLower, oauthID); err == nil && candidate != nil {
+			tempUser = candidate
 		}
 	}
 	if tempUser == nil {
-		if parsedID, parseErr := uuid.Parse(idToken); parseErr == nil {
-			tempUser, err = u.repo.GetByID(parsedID)
+		if parsedOAuthID, parseErr := uuid.Parse(idToken); parseErr == nil {
+			if candidate, err := u.repo.GetByOAuthAccountID(parsedOAuthID); err == nil && candidate != nil && isUnlinkedOAuthPhone(candidate.PhoneNumber) {
+				tempUser = candidate
+			}
 		}
 	}
 	if tempUser == nil {
@@ -1938,6 +2483,8 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 			return nil, err
 		}
 
+		u.consumeVerifiedPhoneMarker(phoneNumber)
+
 		return &domain.AuthResponse{
 			AccessToken:  accessToken,
 			RefreshToken: refreshToken,
@@ -1946,10 +2493,13 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 	}
 
 	// กรณีที่ 2: มีเบอร์นี้ในระบบอยู่แล้ว (ย้าย OAuth Accounts จากบัญชีชั่วคราวมาผูกกับ existingUser)
-	// หากมีการส่ง PIN มาเพื่อยืนยันตัวตน ให้ตรวจสอบ PIN ของ existingUser
-	if pin != "" && existingUser.PinHash != "" {
-		if err := bcrypt.CompareHashAndPassword([]byte(existingUser.PinHash), []byte(pin)); err != nil {
-			return nil, errors.New("รหัส PIN ไม่ถูกต้อง")
+	// หากบัญชีเดิมมี PIN ต้องบังคับตรวจสอบ PIN เสมอ พร้อมระบบป้องกัน Brute-force
+	if existingUser.PinHash != "" {
+		if pin == "" {
+			return nil, errors.New("กรุณาระบุรหัส PIN เพื่อยืนยันการผูกบัญชี")
+		}
+		if err := u.verifyPinWithLockout(phoneNumber, existingUser.PinHash, pin); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1971,7 +2521,7 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		acc := tempUser.OauthAccounts[i]
 		// ลบ record เก่าที่ผูกกับ tempUser ก่อน
 		_ = u.repo.DeleteOauthAccount(acc.ID)
-		
+
 		// สร้าง record ใหม่ผูกกับ existingUser.ID
 		newOauth := &domain.UserOauthAccount{
 			ID:          uuid.New(),
@@ -2088,6 +2638,8 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		return nil, err
 	}
 
+	u.consumeVerifiedPhoneMarker(phoneNumber)
+
 	return &domain.AuthResponse{
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
@@ -2101,12 +2653,9 @@ func (u *authUseCase) bindOverride(req domain.BindOverrideRequest, provider stri
 		return nil, fmt.Errorf("user with phone number not found: %w", err)
 	}
 
-	// Verify PIN for zero-trust security
-	if user.PinHash == "" {
-		return nil, errors.New("บัญชีนี้ยังไม่ได้ตั้งค่ารหัส PIN")
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PinHash), []byte(req.Pin)); err != nil {
-		return nil, errors.New("รหัส PIN ไม่ถูกต้อง")
+	// Verify PIN with brute-force lockout protection
+	if err := u.verifyPinWithLockout(user.PhoneNumber, user.PinHash, req.Pin); err != nil {
+		return nil, err
 	}
 
 	oauthID, err := uuid.Parse(req.OAuthProfileID)
@@ -2220,17 +2769,32 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 	}
 	log.Printf("[ThaiID Debug] BindThaiID Token exchange OK. pid=%s", pid)
 
-	// 3. ป้องกัน Race Condition ด้วย Redis Lock
+	// 3. ป้องกัน Race Condition ด้วย Redis Lock (AcquireLockWithValue + ReleaseLockWithValue)
+	pidHash := u.hashPID(pid)
 	if u.redisClient != nil {
-		lockKey := fmt.Sprintf("lock:thaiid:%s", pid)
-		acquired, err := u.redisClient.AcquireLock(context.Background(), lockKey, 10*time.Second)
-		if err == nil && acquired {
-			defer u.redisClient.ReleaseLock(context.Background(), lockKey)
+		lockKey := fmt.Sprintf("lock:thaiid:%s", pidHash)
+		lockVal := uuid.New().String()
+		var acquired bool
+		for attempt := 0; attempt < 5; attempt++ {
+			var lockErr error
+			acquired, lockErr = u.redisClient.AcquireLockWithValue(context.Background(), lockKey, lockVal, 10*time.Second)
+			if lockErr != nil {
+				break
+			}
+			if acquired {
+				break
+			}
+			time.Sleep(150 * time.Millisecond)
 		}
+		if !acquired {
+			return nil, errors.New("ระบบกำลังดำเนินการผูกบัญชี ThaiID กรุณารอสักครู่แล้วลองใหม่อีกครั้ง")
+		}
+		defer func() {
+			_ = u.redisClient.ReleaseLockWithValue(context.Background(), lockKey, lockVal)
+		}()
 	}
 
 	// 4. ตรวจสอบว่า ThaiID PID นี้ถูกผูกกับบัญชีอื่นอยู่แล้วหรือไม่ (ใช้ pidHash ให้ตรงกับ LoginWithThaiID)
-	pidHash := hmacSHA256(pid, u.config.PIDHmacSecret)
 	if existing, err := u.repo.GetByProviderID("thaiid", pidHash); err == nil {
 		if existing.ID.String() != userID {
 			// สร้าง Migration Token เก็บไว้ใน Redis เพื่อรอการยืนยันย้ายบัญชีจากผู้ใช้ (TTL 5 นาที)
@@ -2287,10 +2851,10 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 
 	// 7. สร้าง OauthAccount ใหม่และ CreateOauthAccount
 	oauthAcc := &domain.UserOauthAccount{
-		ID:          uuid.New(),
-		UserId:      parsedID,
-		Provider:    "thaiid",
-		ProviderId:  pidHash, // Stored as HMAC hash consistent with LoginWithThaiID
+		ID:         uuid.New(),
+		UserId:     parsedID,
+		Provider:   "thaiid",
+		ProviderId: pidHash, // Stored as HMAC hash consistent with LoginWithThaiID
 		DisplayName: func() string {
 			if n, ok := dopaProfile["name"].(string); ok && n != "" {
 				return n
@@ -2312,14 +2876,14 @@ func (u *authUseCase) BindThaiID(userID string, code string, redirectURI string)
 		user.Information.VerificationStatus = "verified"
 		user.Information.VerifiedDate = &now
 
-		// Hash PID using HMAC-SHA256 (consistent with LoginWithThaiID)
-		user.Information.IdentityNumberHash = hmacSHA256(pid, u.config.PIDHmacSecret)
+		// Hash & Encrypt PID using HMAC-SHA256 & AES-256-GCM
+		user.Information.IdentityNumberHash = pidHash
 		if user.Information.IdentityNumberEncrypted == "" {
-			if encrypted, err := encryptAES256GCM(pid, u.config.PIDEncryptionKey); err == nil {
-				user.Information.IdentityNumberEncrypted = encrypted
-			} else {
-				user.Information.IdentityNumberEncrypted = "ENC_" + pid
+			encrypted, encErr := u.encryptPID(pid)
+			if encErr != nil {
+				return nil, fmt.Errorf("failed to encrypt PID: %w", encErr)
 			}
+			user.Information.IdentityNumberEncrypted = encrypted
 		}
 
 		// อัปเดตชื่อ-นามสกุลทางการจาก DOPA ThaiID
@@ -2448,7 +3012,7 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 		return nil
 
 	case "facebook":
-		fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", req.AccessToken)
+		fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", url.QueryEscape(req.AccessToken))
 		fbReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fbURL, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create facebook request: %w", err)
@@ -2465,9 +3029,9 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 		}
 
 		var fbProfile struct {
-			ID    string `json:"id"`
-			Name  string `json:"name"`
-			Email string `json:"email"`
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			Email   string `json:"email"`
 			Picture struct {
 				Data struct {
 					URL string `json:"url"`
@@ -2496,6 +3060,7 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 
 	case "line":
 		lineAccessToken := req.AccessToken
+		exchangedViaCode := false
 		if req.AuthCode != "" {
 			tokenData := url.Values{}
 			tokenData.Set("grant_type", "authorization_code")
@@ -2514,9 +3079,16 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 					}
 					if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err == nil && tokenResult.AccessToken != "" {
 						lineAccessToken = tokenResult.AccessToken
+						exchangedViaCode = true
 					}
 					tokenResp.Body.Close()
 				}
+			}
+		}
+
+		if !exchangedViaCode {
+			if err := u.verifyLineAccessToken(lineAccessToken); err != nil {
+				return fmt.Errorf("failed to verify line token channel: %w", err)
 			}
 		}
 
@@ -2561,7 +3133,11 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 		return nil
 
 	case "apple":
-		claims, err := verifyAppleIDToken(req.IDToken)
+		appleBundleID := ""
+		if u.config != nil {
+			appleBundleID = u.config.AppleBundleID
+		}
+		claims, err := verifyAppleIDToken(req.IDToken, appleBundleID)
 		if err != nil {
 			return fmt.Errorf("invalid apple id token: %w", err)
 		}
@@ -2650,6 +3226,253 @@ func (u *authUseCase) UpdateProfileImage(userID uuid.UUID, imageURL string) erro
 	return u.repo.UpdateProfileImage(userID, imageURL)
 }
 
+func (u *authUseCase) UpdateProfile(userID uuid.UUID, req domain.UpdateProfileRequest) (*domain.AppUser, error) {
+	user, err := u.repo.GetByID(userID)
+	if err != nil || user == nil {
+		return nil, fmt.Errorf("user not found: %w", err)
+	}
+
+	now := time.Now()
+	if user.Information == nil {
+		user.Information = &domain.UserInformation{
+			UserId:             userID,
+			Phone:              user.PhoneNumber,
+			Status:             "active",
+			VerificationStatus: "unverified",
+			IsConsent:          true,
+			CreatedDate:        now,
+		}
+	}
+
+	if req.Prefix != nil {
+		user.Information.Prefix = strings.TrimSpace(*req.Prefix)
+	}
+	if req.Name != nil {
+		user.Information.Name = strings.TrimSpace(*req.Name)
+	}
+	if req.LastName != nil {
+		user.Information.LastName = strings.TrimSpace(*req.LastName)
+	}
+	if req.Email != nil {
+		emailTrimmed := strings.TrimSpace(*req.Email)
+		if emailTrimmed == "" {
+			user.Email = nil
+			user.EmailHash = nil
+			user.Information.Email = nil
+		} else {
+			emailHash := hashValue(strings.ToLower(emailTrimmed))
+			user.Email = &emailTrimmed
+			user.EmailHash = &emailHash
+			user.Information.Email = &emailTrimmed
+		}
+	}
+	if req.Birthday != nil {
+		bdayStr := strings.TrimSpace(*req.Birthday)
+		if bdayStr == "" {
+			user.Information.Birthday = nil
+		} else {
+			parsedTime, parseErr := time.Parse("2006-01-02", bdayStr)
+			if parseErr != nil {
+				parsedTime, parseErr = time.Parse(time.RFC3339, bdayStr)
+			}
+			if parseErr == nil {
+				user.Information.Birthday = &parsedTime
+			}
+		}
+	}
+	if req.HouseNumber != nil {
+		user.Information.HouseNumber = strings.TrimSpace(*req.HouseNumber)
+	}
+	if req.VillageNumber != nil {
+		user.Information.VillageNumber = strings.TrimSpace(*req.VillageNumber)
+	}
+	if req.Alley != nil {
+		user.Information.Alley = strings.TrimSpace(*req.Alley)
+	}
+	if req.Road != nil {
+		user.Information.Road = strings.TrimSpace(*req.Road)
+	}
+	if req.Intersection != nil {
+		user.Information.Intersection = strings.TrimSpace(*req.Intersection)
+	}
+	if req.BuildingName != nil {
+		user.Information.BuildingName = strings.TrimSpace(*req.BuildingName)
+	}
+	if req.RoomNumber != nil {
+		user.Information.RoomNumber = strings.TrimSpace(*req.RoomNumber)
+	}
+	if req.Subdistrict != nil {
+		user.Information.Subdistrict = strings.TrimSpace(*req.Subdistrict)
+	}
+	if req.District != nil {
+		user.Information.District = strings.TrimSpace(*req.District)
+	}
+	if req.Province != nil {
+		user.Information.Province = strings.TrimSpace(*req.Province)
+	}
+	if req.PostalCode != nil {
+		user.Information.PostalCode = *req.PostalCode
+	}
+	if req.CardAddress != nil {
+		user.Information.CardAddress = strings.TrimSpace(*req.CardAddress)
+	}
+
+	user.UpdatedDate = now
+	user.Information.UpdatedDate = now
+
+	if err := u.repo.Update(user); err != nil {
+		return nil, fmt.Errorf("failed to update profile: %w", err)
+	}
+
+	updatedUser, err := u.repo.GetByID(userID)
+	if err != nil || updatedUser == nil {
+		return user, nil
+	}
+	return updatedUser, nil
+}
+
+func isSixDigitPin(pin string) bool {
+	if len(pin) != 6 {
+		return false
+	}
+	for _, c := range pin {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func (u *authUseCase) clearPinLockout(keys ...string) {
+	ctx := context.Background()
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		if u.redisClient != nil && u.redisClient.Raw() != nil {
+			_ = u.redisClient.Raw().Del(ctx, fmt.Sprintf("auth:pin_attempts:%s", k), fmt.Sprintf("auth:pin_lockout:%s", k))
+		}
+		u.pinMu.Lock()
+		delete(u.pinStore, k)
+		u.pinMu.Unlock()
+	}
+}
+
+func (u *authUseCase) ChangePin(userID uuid.UUID, oldPin, newPin string) error {
+	oldPin = strings.TrimSpace(oldPin)
+	newPin = strings.TrimSpace(newPin)
+	if !isSixDigitPin(newPin) {
+		return errors.New("รหัส PIN ใหม่ต้องเป็นตัวเลข 6 หลัก")
+	}
+
+	user, err := u.repo.GetByID(userID)
+	if err != nil || user == nil {
+		return errors.New("ไม่พบข้อมูลผู้ใช้งาน")
+	}
+
+	if user.PinHash != "" {
+		if oldPin == "" {
+			return errors.New("กรุณาระบุรหัส PIN เดิม")
+		}
+		if err := u.verifyPinWithLockout(user.ID.String(), user.PinHash, oldPin); err != nil {
+			return err
+		}
+	}
+
+	hashedPin, err := bcrypt.GenerateFromPassword([]byte(newPin), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("failed to hash pin: %w", err)
+	}
+
+	user.PinHash = string(hashedPin)
+	user.UpdatedDate = time.Now()
+	if err := u.repo.Update(user); err != nil {
+		return fmt.Errorf("failed to update pin: %w", err)
+	}
+
+	u.clearPinLockout(user.ID.String(), user.PhoneNumber)
+	return nil
+}
+
+func (u *authUseCase) ResetPin(tempToken, phoneNumber, newPin string) (*domain.AuthResponse, error) {
+	newPin = strings.TrimSpace(newPin)
+	if !isSixDigitPin(newPin) {
+		return nil, errors.New("รหัส PIN ใหม่ต้องเป็นตัวเลข 6 หลัก")
+	}
+
+	resolvedPhone := ""
+	if strings.TrimSpace(tempToken) != "" {
+		parsedToken, err := jwt.Parse(strings.TrimSpace(tempToken), func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+			return []byte(u.config.JWTSecret), nil
+		})
+		if err == nil && parsedToken != nil && parsedToken.Valid {
+			if claims, ok := parsedToken.Claims.(jwt.MapClaims); ok {
+				if p, ok := claims["phone_number"].(string); ok && p != "" {
+					resolvedPhone = normalizePhoneNumber(p)
+				} else if p, ok := claims["phone"].(string); ok && p != "" {
+					resolvedPhone = normalizePhoneNumber(p)
+				}
+			}
+		}
+	}
+
+	if resolvedPhone == "" && strings.TrimSpace(phoneNumber) != "" {
+		candidatePhone := normalizePhoneNumber(phoneNumber)
+		if u.hasVerifiedPhoneMarker(candidatePhone) {
+			resolvedPhone = candidatePhone
+		}
+	}
+
+	if resolvedPhone == "" {
+		return nil, errors.New("invalid or expired OTP verification token")
+	}
+
+	user, err := u.repo.GetByPhoneNumber(resolvedPhone)
+	if err != nil || user == nil {
+		return nil, errors.New("ไม่พบบัญชีผู้ใช้งานสำหรับเบอร์โทรศัพท์นี้")
+	}
+
+	hashedPin, err := bcrypt.GenerateFromPassword([]byte(newPin), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to hash pin: %w", err)
+	}
+
+	user.PinHash = string(hashedPin)
+	user.UpdatedDate = time.Now()
+	if err := u.repo.Update(user); err != nil {
+		return nil, fmt.Errorf("failed to reset pin: %w", err)
+	}
+
+	u.consumeVerifiedPhoneMarker(resolvedPhone)
+	u.clearPinLockout(resolvedPhone, user.PhoneNumber, user.ID.String())
+
+	if freshUser, err := u.repo.GetByID(user.ID); err == nil && freshUser != nil {
+		user = freshUser
+	}
+
+	accessToken, err := u.generateAccessToken(user)
+	if err != nil {
+		return nil, err
+	}
+	refreshToken, err := u.generateRefreshToken(user)
+	if err != nil {
+		return nil, err
+	}
+
+	return &domain.AuthResponse{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		User:         user,
+	}, nil
+}
+
+func (u *authUseCase) DeleteAccount(userID uuid.UUID) error {
+	return u.repo.SoftDeleteUser(userID)
+}
+
 func (u *authUseCase) ConfirmThaiIDMigration(userID, migrationToken string) (*domain.AuthResponse, error) {
 	if migrationToken == "" {
 		return nil, errors.New("migration_token is required")
@@ -2690,7 +3513,7 @@ func (u *authUseCase) ConfirmThaiIDMigration(userID, migrationToken string) (*do
 
 	pid := migrationData.PID
 	dopaProfile := migrationData.DOPAProfile
-	pidHash := hmacSHA256(pid, u.config.PIDHmacSecret)
+	pidHash := u.hashPID(pid)
 
 	// Safe profile for raw JSON
 	safeProfile := make(map[string]interface{})
@@ -2721,11 +3544,9 @@ func (u *authUseCase) ConfirmThaiIDMigration(userID, migrationToken string) (*do
 
 	now := time.Now()
 	idCardTypeVal := 1
-	var encryptedPID string
-	if enc, err := encryptAES256GCM(pid, u.config.PIDEncryptionKey); err == nil {
-		encryptedPID = enc
-	} else {
-		encryptedPID = "ENC_" + pid
+	encryptedPID, encErr := u.encryptPID(pid)
+	if encErr != nil {
+		return nil, fmt.Errorf("failed to encrypt PID: %w", encErr)
 	}
 
 	updateInfo := &domain.UserInformation{

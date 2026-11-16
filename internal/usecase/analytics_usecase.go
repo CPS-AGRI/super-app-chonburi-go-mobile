@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"super-app-chonburi-go-mobile/internal/domain"
+	"super-app-chonburi-go-mobile/pkg/safe"
 )
 
 type analyticsUseCase struct {
@@ -21,8 +22,9 @@ func NewAnalyticsUseCase(repo domain.AnalyticsRepository) domain.AnalyticsUseCas
 	}
 
 	// Background routine to evict expired cooldown entries every 10 minutes
-	go func() {
+	safe.Go(func() {
 		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
 		for range ticker.C {
 			now := time.Now()
 			uc.cooldownCache.Range(func(key, val interface{}) bool {
@@ -34,7 +36,7 @@ func NewAnalyticsUseCase(repo domain.AnalyticsRepository) domain.AnalyticsUseCas
 				return true
 			})
 		}
-	}()
+	})
 
 	return uc
 }
@@ -91,12 +93,12 @@ func (u *analyticsUseCase) TrackModuleUsage(req *domain.RecordModuleUsageDTO, us
 		CreatedAt:  now,
 	}
 
-	// 4. Asynchronously persist to DB without blocking HTTP client
-	go func(record *domain.ModuleUsageLog) {
-		if err := u.repo.RecordUsage(record); err != nil {
+	// 4. Asynchronously persist to DB without blocking HTTP client (Safe Panic Protected)
+	safe.Go(func() {
+		if err := u.repo.RecordUsage(usageLog); err != nil {
 			log.Printf("⚠️ [Analytics] Failed to record module usage: %v", err)
 		}
-	}(usageLog)
+	})
 
 	return nil
 }

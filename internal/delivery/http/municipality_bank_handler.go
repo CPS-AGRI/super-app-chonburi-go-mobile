@@ -13,8 +13,10 @@ type municipalityBankHandler struct {
 func NewMunicipalityBankHandler(app *fiber.App, uc domain.MunicipalityBankUseCase) {
 	handler := &municipalityBankHandler{uc: uc}
 
-	group := app.Group("/api/v1/municipalities/bank")
-	group.Get("/default", handler.GetActiveBank)
+	for _, prefix := range []string{"/api/v1/municipalities/bank", "/api/v1/mobile/municipalities/bank"} {
+		group := app.Group(prefix)
+		group.Get("/default", handler.GetActiveBank)
+	}
 }
 
 func (h *municipalityBankHandler) GetActiveBank(c fiber.Ctx) error {

@@ -16,6 +16,7 @@ import (
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
 	"super-app-chonburi-go-mobile/internal/infrastructure"
+	"super-app-chonburi-go-mobile/pkg/safe"
 
 	"golang.org/x/sync/singleflight"
 	"gorm.io/gorm"
@@ -35,11 +36,17 @@ type WaterLevelRepository interface {
 	FetchGatewayDevices(ctx context.Context) ([]domain.GatewayRiverDevice, error)
 	FetchGatewayDeviceDetail(ctx context.Context, serial string) (*domain.GatewayDeviceDetailEnvelope, error)
 	FetchGatewayDeviceHistory(ctx context.Context, serial string, timeframe int) ([]domain.GatewayHistoryPoint, error)
+	FetchGatewayDeviceForecast(ctx context.Context, serial string, days int, date string) (*domain.GatewayForecastResponse, error)
 	FetchGatewaySnapshots(ctx context.Context, serial, date string) ([]domain.GatewaySnapshotLog, error)
 	InitGatewayStream(ctx context.Context, serial string) (*domain.WaterStreamResult, error)
 	TerminateGatewayStream(ctx context.Context, serial string) error
 	FetchActiveAlerts(ctx context.Context) ([]domain.GatewayAlertItem, error)
 	RelayWebRTCOffer(ctx context.Context, serial, sdpOffer string) (string, error)
+}
+
+type forecastCacheEntry struct {
+	data     *domain.GatewayForecastResponse
+	cachedAt time.Time
 }
 
 type waterLevelRepository struct {
@@ -56,13 +63,17 @@ type waterLevelRepository struct {
 	l1AlertsMu       sync.RWMutex
 	l1AlertsCache    []domain.GatewayAlertItem
 	l1AlertsCachedAt time.Time
+
+	l1ForecastMu    sync.RWMutex
+	l1ForecastCache map[string]forecastCacheEntry
 }
 
 func NewWaterLevelRepository(db *gorm.DB, cfg *config.Config, redisClient *infrastructure.RedisClient) WaterLevelRepository {
 	return &waterLevelRepository{
-		db:          db,
-		cfg:         cfg,
-		redisClient: redisClient,
+		db:              db,
+		cfg:             cfg,
+		redisClient:     redisClient,
+		l1ForecastCache: make(map[string]forecastCacheEntry),
 		httpClient: &http.Client{
 			Timeout: 8 * time.Second,
 			Transport: &http.Transport{
@@ -136,6 +147,9 @@ func (r *waterLevelRepository) FetchGatewayDevices(ctx context.Context) ([]domai
 
 	// 3. Singleflight coalesce concurrent requests on cache miss
 	res, err, _ := r.sf.Do("fetch_gateway_devices_"+r.cfg.RiverMunicipalityID, func() (interface{}, error) {
+		sfCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+
 		// Re-check L1 in case populated while waiting for singleflight slot
 		r.l1Mu.RLock()
 		if r.l1Cache != nil && time.Since(r.l1CachedAt) < l1TTLWaterStationsAll {
@@ -146,7 +160,7 @@ func (r *waterLevelRepository) FetchGatewayDevices(ctx context.Context) ([]domai
 		r.l1Mu.RUnlock()
 
 		// 4. Fetch Live from ff-river-services
-		req, err := r.buildGatewayRequest(ctx, http.MethodGet, "/api/v1/river/devices", nil)
+		req, err := r.buildGatewayRequest(sfCtx, http.MethodGet, "/api/v1/river/devices", nil)
 		if err != nil {
 			return nil, err
 		}
@@ -176,9 +190,11 @@ func (r *waterLevelRepository) FetchGatewayDevices(ctx context.Context) ([]domai
 
 		// Update L2 Redis Cache asynchronously
 		if r.redisClient != nil {
-			go func(d []domain.GatewayRiverDevice, key string) {
+			d := devices
+			key := redisKey
+			safe.Go(func() {
 				_ = r.redisClient.SetJSON(context.Background(), key, d, redisTTLWaterStationsAll)
-			}(devices, redisKey)
+			})
 		}
 
 		return devices, nil
@@ -254,6 +270,98 @@ func (r *waterLevelRepository) FetchGatewayDeviceHistory(ctx context.Context, se
 		return nil, err
 	}
 	return points, nil
+}
+
+func (r *waterLevelRepository) FetchGatewayDeviceForecast(ctx context.Context, serial string, days int, date string) (*domain.GatewayForecastResponse, error) {
+	if days != 7 {
+		days = 1
+	}
+	cacheKey := fmt.Sprintf("chonburi:water:forecast:%s:%d:%s", serial, days, date)
+
+	// 1. Check L1 Memory Cache (60s TTL)
+	r.l1ForecastMu.RLock()
+	if entry, ok := r.l1ForecastCache[cacheKey]; ok && time.Since(entry.cachedAt) < 60*time.Second {
+		r.l1ForecastMu.RUnlock()
+		return entry.data, nil
+	}
+	r.l1ForecastMu.RUnlock()
+
+	// 2. Check L2 Redis Cache (5m TTL)
+	if r.redisClient != nil {
+		var cached domain.GatewayForecastResponse
+		if err := r.redisClient.GetJSON(ctx, cacheKey, &cached); err == nil {
+			r.l1ForecastMu.Lock()
+			if len(r.l1ForecastCache) > 500 {
+				for k, v := range r.l1ForecastCache {
+					if time.Since(v.cachedAt) >= 60*time.Second {
+						delete(r.l1ForecastCache, k)
+					}
+				}
+			}
+			r.l1ForecastCache[cacheKey] = forecastCacheEntry{data: &cached, cachedAt: time.Now()}
+			r.l1ForecastMu.Unlock()
+			return &cached, nil
+		}
+	}
+
+	// 3. Singleflight coalesce on cache miss
+	res, err, _ := r.sf.Do(cacheKey, func() (interface{}, error) {
+		sfCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+
+		q := url.Values{}
+		if date != "" {
+			q.Set("date", date)
+		} else {
+			q.Set("days", fmt.Sprintf("%d", days))
+		}
+		path := fmt.Sprintf("/api/v1/river/devices/%s/forecast?%s", url.PathEscape(serial), q.Encode())
+
+		req, err := r.buildGatewayRequest(sfCtx, http.MethodGet, path, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := r.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("gateway forecast error %d: %s", resp.StatusCode, string(body))
+		}
+
+		var out domain.GatewayForecastResponse
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return nil, err
+		}
+
+		r.l1ForecastMu.Lock()
+		if len(r.l1ForecastCache) > 500 {
+			for k, v := range r.l1ForecastCache {
+				if time.Since(v.cachedAt) >= 60*time.Second {
+					delete(r.l1ForecastCache, k)
+				}
+			}
+		}
+		r.l1ForecastCache[cacheKey] = forecastCacheEntry{data: &out, cachedAt: time.Now()}
+		r.l1ForecastMu.Unlock()
+
+		if r.redisClient != nil {
+			copyOut := out
+			safe.Go(func() {
+				_ = r.redisClient.SetJSON(context.Background(), cacheKey, &copyOut, 5*time.Minute)
+			})
+		}
+
+		return &out, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.(*domain.GatewayForecastResponse), nil
 }
 
 func (r *waterLevelRepository) FetchGatewaySnapshots(ctx context.Context, serial, date string) ([]domain.GatewaySnapshotLog, error) {
@@ -351,13 +459,16 @@ func (r *waterLevelRepository) FetchActiveAlerts(ctx context.Context) ([]domain.
 
 	// 3. Singleflight coalesce concurrent calls during high-load alerts
 	res, err, _ := r.sf.Do("fetch_active_alerts", func() (interface{}, error) {
+		sfCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+
 		baseURL := r.cfg.RiverServiceURL
 		if baseURL == "" {
 			baseURL = "http://10.1.2.19:8081"
 		}
 		path := fmt.Sprintf("%s/api/v1/internal/alerts/active", baseURL)
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
+		req, err := http.NewRequestWithContext(sfCtx, http.MethodGet, path, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -386,9 +497,10 @@ func (r *waterLevelRepository) FetchActiveAlerts(ctx context.Context) ([]domain.
 
 		// Update L2 Redis Cache asynchronously
 		if r.redisClient != nil {
-			go func(a []domain.GatewayAlertItem) {
+			a := alerts
+			safe.Go(func() {
 				_ = r.redisClient.SetJSON(context.Background(), redisKeyActiveAlerts, a, redisTTLActiveAlerts)
-			}(alerts)
+			})
 		}
 
 		return alerts, nil

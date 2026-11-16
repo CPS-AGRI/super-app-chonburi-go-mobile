@@ -86,6 +86,7 @@ type WeatherSubscriptionRepository interface {
 	Create(sub *UserWeatherSubscription) error
 	Delete(id uuid.UUID, userID uuid.UUID) error
 	GetAlertHistory(subdistricts []string, limit int) ([]WeatherAlertHistory, error)
+	GetFloodAlertHistory(subdistricts []string, limit int) ([]WeatherAlertHistory, error)
 }
 
 // WeatherSubscriptionUseCase defines business logic for subscription management.
@@ -95,6 +96,7 @@ type WeatherSubscriptionUseCase interface {
 	RemoveSubscription(id uuid.UUID, userID uuid.UUID) error
 	SyncPrimaryFromAddress(userID uuid.UUID, district, subdistrict string) error
 	GetAlertHistory(userID uuid.UUID, limit int) ([]WeatherAlertFeedResponse, error)
+	GetFloodAlertHistory(userID uuid.UUID, limit int) ([]WeatherAlertFeedResponse, error)
 }
 
 // ============================================================
@@ -216,4 +218,35 @@ type WeatherStationsResult struct {
 	Total      int                 `json:"total"`
 	CachedAt   time.Time           `json:"cachedAt"`
 	IsFallback bool                `json:"isFallback,omitempty"`
+}
+
+// ============================================================
+// Weather Overview Models (BFF for Mobile App Overview Tab)
+// ============================================================
+
+type WeatherOverviewSubdistrict struct {
+	Name       string                `json:"name"`
+	RainAmount float64               `json:"rain_amount"`
+	TempMin    float64               `json:"temp_min"`
+	TempAvg    float64               `json:"temp_avg"`
+	TempMax    float64               `json:"temp_max"`
+	PM1        float64               `json:"pm1"`
+	PM25       float64               `json:"pm25"`
+	PM4        float64               `json:"pm4"`
+	PM10       float64               `json:"pm10"`
+	History    []WeatherChartHistory `json:"history"`
+}
+
+type WeatherChartHistory struct {
+	Label string  `json:"label"`
+	Value float64 `json:"value"`
+}
+
+type WeatherOverviewResult struct {
+	District          string                       `json:"district"`
+	Period            string                       `json:"period"`
+	Date              string                       `json:"date"`
+	TotalSubdistricts int                          `json:"total_subdistricts"`
+	Subdistricts      []WeatherOverviewSubdistrict `json:"subdistricts"`
+	CachedAt          time.Time                    `json:"cached_at"`
 }

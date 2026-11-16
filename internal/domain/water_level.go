@@ -20,6 +20,12 @@ type WaterStation struct {
 	Serial         string              `json:"serial"`
 	CommonSizeName string              `json:"commonSizeName,omitempty"`
 	PctToBank      float64             `json:"pctToBank"`
+	SensorMode     string              `json:"sensorMode"` // "RIVER" | "SURFACE"
+	BottomToBankCM float64             `json:"bottomToBankCM"`
+	NetWaterLevelCM float64            `json:"netWaterLevelCM"`
+	Subdistrict    string              `json:"subdistrict,omitempty"`
+	District       string              `json:"district,omitempty"`
+	HasForecast    bool                `json:"hasForecast"`
 }
 
 // WaterHistoryPoint represents a historical data point for charting
@@ -37,13 +43,15 @@ type WaterHistoryPoint struct {
 
 // WaterAlert represents an active flood warning alert
 type WaterAlert struct {
-	ID       string `json:"id"`
-	Title    string `json:"title"`
-	Detail   string `json:"detail"`
-	Location string `json:"location"`
-	Time     string `json:"time"`
-	Severity string `json:"severity"` // "normal" | "warning" | "critical" | "emergency"
-	Unread   bool   `json:"unread,omitempty"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Detail      string `json:"detail"`
+	Location    string `json:"location"`
+	Subdistrict string `json:"subdistrict,omitempty"`
+	District    string `json:"district,omitempty"`
+	Time        string `json:"time"`
+	Severity    string `json:"severity"` // "normal" | "warning" | "critical" | "emergency"
+	Unread      bool   `json:"unread,omitempty"`
 }
 
 // WaterSnapshotLog represents an hourly camera snapshot log
@@ -59,6 +67,8 @@ type WaterDeviceDetail struct {
 	Serial        string  `json:"serial"`
 	Name          string  `json:"name"`
 	Location      string  `json:"location"`
+	Subdistrict   string  `json:"subdistrict,omitempty"`
+	District      string  `json:"district,omitempty"`
 	Lat           float64 `json:"lat"`
 	Lng           float64 `json:"lng"`
 	Status        string  `json:"status"`
@@ -71,6 +81,18 @@ type WaterDeviceDetail struct {
 	SnapshotURL   string  `json:"snapshotUrl,omitempty"`
 	CCTV          string  `json:"cctv,omitempty"`
 	PctToBank     float64 `json:"pctToBank,omitempty"`
+	HasForecast   bool    `json:"hasForecast"`
+}
+
+// WaterForecastResult represents forecast chart response for mobile apps
+type WaterForecastResult struct {
+	Success         bool                `json:"success"`
+	Serial          string              `json:"serial"`
+	HasForecast     bool                `json:"hasForecast"`
+	IntervalMinutes int                 `json:"intervalMinutes"`
+	MinDate         string              `json:"minDate,omitempty"`
+	MaxDate         string              `json:"maxDate,omitempty"`
+	Items           []WaterHistoryPoint `json:"items"`
 }
 
 // WaterStreamResult represents RTSP / HLS / WebRTC stream response
@@ -108,6 +130,7 @@ type GatewayRiverDevice struct {
 	CCTVPath0        string  `json:"cctv_path_0"`
 	CCTVPath1        string  `json:"cctv_path_1"`
 	TimestampUTC     int64   `json:"timestamp_utc"`
+	HasForecast      bool    `json:"has_forecast"`
 }
 
 // GatewayHistoryPoint represents stats point from ff-river-services
@@ -158,11 +181,30 @@ type GatewayDeviceDetailEnvelope struct {
 		BankToSensorCM  float64 `json:"bank_to_sensor_cm"`
 	} `json:"config"`
 	Thresholds []struct {
-		AlertLevel  string  `json:"alert_level"`
-		ThresholdCM float64 `json:"threshold_cm"`
+		AlertLevel   string   `json:"alert_level"`
+		ThresholdCM  float64  `json:"threshold_cm"`
 		ThresholdPct *float64 `json:"threshold_pct"`
-		IsActive    bool    `json:"is_active"`
+		IsActive     bool     `json:"is_active"`
 	} `json:"thresholds"`
+	HasForecast bool `json:"has_forecast"`
+}
+
+// GatewayForecastPoint represents a forecasted water level point from ff-river-services
+type GatewayForecastPoint struct {
+	Time            string  `json:"time"`
+	NetWaterLevelCM float64 `json:"net_water_level_cm"`
+	WaterLevelPct   float64 `json:"water_level_pct"`
+	WarningStatus   string  `json:"warning_status"`
+}
+
+// GatewayForecastResponse represents response of /api/v1/river/devices/:serial/forecast
+type GatewayForecastResponse struct {
+	Serial          string                 `json:"serial"`
+	HasForecast     bool                   `json:"has_forecast"`
+	IntervalMinutes int                    `json:"interval_minutes"`
+	MinDate         string                 `json:"min_date,omitempty"`
+	MaxDate         string                 `json:"max_date,omitempty"`
+	Items           []GatewayForecastPoint `json:"items"`
 }
 
 // GatewayAlertItem represents alert from /api/v1/internal/alerts/active or /api/v1/river/alerts/active

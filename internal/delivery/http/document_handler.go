@@ -24,10 +24,12 @@ func NewDocumentHandler(app *fiber.App) {
 
 	h := &DocumentHandler{docDir: docDir}
 
-	group := app.Group("/api/v1/documents")
-	group.Get("/terms", h.GetTerms)
-	group.Get("/privacy", h.GetPrivacy)
-	group.Get("/file/:filename", h.ServeFile)
+	for _, prefix := range []string{"/api/v1/documents", "/api/v1/mobile/documents"} {
+		group := app.Group(prefix)
+		group.Get("/terms", h.GetTerms)
+		group.Get("/privacy", h.GetPrivacy)
+		group.Get("/file/:filename", h.ServeFile)
+	}
 }
 
 func (h *DocumentHandler) GetTerms(c fiber.Ctx) error {

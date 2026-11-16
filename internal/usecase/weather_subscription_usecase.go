@@ -108,29 +108,63 @@ func (u *weatherSubscriptionUseCase) GetAlertHistory(userID uuid.UUID, limit int
 	now := time.Now()
 	resp := make([]domain.WeatherAlertFeedResponse, 0, len(alerts))
 	for _, a := range alerts {
-		// Calculate user-friendly Thai relative time
-		diff := now.Sub(a.CreatedAt)
-		var timeStr string
-		if diff < time.Minute {
-			timeStr = "เมื่อสักครู่"
-		} else if diff < time.Hour {
-			timeStr = fmt.Sprintf("%d นาทีที่แล้ว", int(diff.Minutes()))
-		} else if diff < 24*time.Hour {
-			timeStr = fmt.Sprintf("วันนี้ %s น.", a.CreatedAt.Format("15:04"))
-		} else {
-			timeStr = a.CreatedAt.Format("02/01/2006 15:04 น.")
-		}
-
 		resp = append(resp, domain.WeatherAlertFeedResponse{
 			ID:        a.ID.String(),
 			Title:     a.Title,
 			Message:   a.Message,
-			Timestamp: timeStr,
+			Timestamp: formatRelativeThaiTime(now, a.CreatedAt),
 			Type:      a.AlertType,
 			Level:     a.Severity,
 			ImageURL:  a.ImageURL,
 		})
 	}
 	return resp, nil
+}
+
+// GetFloodAlertHistory returns recent flood/water-level alerts matching the user's subscribed areas.
+func (u *weatherSubscriptionUseCase) GetFloodAlertHistory(userID uuid.UUID, limit int) ([]domain.WeatherAlertFeedResponse, error) {
+	subs, err := u.repo.GetByUserID(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	var subdistricts []string
+	for _, s := range subs {
+		if s.Subdistrict != "" {
+			subdistricts = append(subdistricts, s.Subdistrict)
+		}
+	}
+
+	alerts, err := u.repo.GetFloodAlertHistory(subdistricts, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	resp := make([]domain.WeatherAlertFeedResponse, 0, len(alerts))
+	for _, a := range alerts {
+		resp = append(resp, domain.WeatherAlertFeedResponse{
+			ID:        a.ID.String(),
+			Title:     a.Title,
+			Message:   a.Message,
+			Timestamp: formatRelativeThaiTime(now, a.CreatedAt),
+			Type:      "flood",
+			Level:     a.Severity,
+			ImageURL:  a.ImageURL,
+		})
+	}
+	return resp, nil
+}
+
+func formatRelativeThaiTime(now, t time.Time) string {
+	diff := now.Sub(t)
+	if diff < time.Minute {
+		return "เมื่อสักครู่"
+	} else if diff < time.Hour {
+		return fmt.Sprintf("%d นาทีที่แล้ว", int(diff.Minutes()))
+	} else if diff < 24*time.Hour {
+		return fmt.Sprintf("วันนี้ %s น.", t.Format("15:04"))
+	}
+	return t.Format("02/01/2006 15:04 น.")
 }
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"super-app-chonburi-go-mobile/internal/domain"
+	"super-app-chonburi-go-mobile/pkg/safe"
 
 	"github.com/google/uuid"
 )
@@ -198,14 +199,14 @@ func (u *verificationUseCase) UpdateAddress(userID uuid.UUID, req *domain.Update
 	if err := u.repo.UpdateAddress(userID, req); err != nil {
 		return err
 	}
-	// Auto-sync primary weather subscription to match the new home address (fire-and-forget)
+	// Auto-sync primary weather subscription to match the new home address (Safe Panic Protected)
 	if u.subsSvc != nil && req.Subdistrict != "" && req.District != "" {
-		go func() {
+		safe.Go(func() {
 			if err := u.subsSvc.SyncPrimaryFromAddress(userID, req.District, req.Subdistrict); err != nil {
 				// Non-critical: log but do not fail the address update
 				_ = err
 			}
-		}()
+		})
 	}
 	return nil
 }

@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"super-app-chonburi-go-mobile/config"
+	"super-app-chonburi-go-mobile/internal/delivery/http/middleware"
 	"super-app-chonburi-go-mobile/internal/domain"
 	"super-app-chonburi-go-mobile/internal/infrastructure"
 	"super-app-chonburi-go-mobile/internal/usecase"
 	"super-app-chonburi-go-mobile/pkg/jwtutil"
+	"super-app-chonburi-go-mobile/pkg/safe"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
@@ -54,12 +56,33 @@ func NewCCTVHandler(
 		redisClient: redisClient,
 	}
 
-	// 1. Mobile App Endpoints (JWT Protected)
-	mobileGroup := app.Group("/api/v1/mobile/cctv", jwtutil.RequireAuth(cfg))
-	mobileGroup.Get("/", handler.GetCameras)
-	mobileGroup.Post("/requests", handler.CreateRequest)
-	mobileGroup.Get("/requests/my-requests", handler.GetMyRequests)
-	mobileGroup.Post("/handshake-ticket", handler.CreateHandshakeTicket) // Channel 1
+	// Background eviction of expired in-memory blocklist entries
+	safe.Go(func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			handler.blocklist.Range(func(key, value interface{}) bool {
+				if entry, ok := value.(blockedEntry); ok {
+					if now.After(entry.expiresAt) {
+						handler.blocklist.Delete(key)
+					}
+				} else {
+					handler.blocklist.Delete(key)
+				}
+				return true
+			})
+		}
+	})
+
+	// 1. Mobile App Endpoints (JWT Protected) - Mirrored on /api/v1/cctv and /api/v1/mobile/cctv
+	for _, prefix := range []string{"/api/v1/cctv", "/api/v1/mobile/cctv"} {
+		mobileGroup := app.Group(prefix, jwtutil.RequireAuth(cfg))
+		mobileGroup.Get("/", handler.GetCameras)
+		mobileGroup.Post("/requests", handler.CreateRequest)
+		mobileGroup.Get("/requests/my-requests", handler.GetMyRequests)
+		mobileGroup.Post("/handshake-ticket", handler.CreateHandshakeTicket) // Channel 1
+	}
 
 	// 2. Partner Server-to-Server Endpoints (Ph6 Direct Spec & Alias)
 	app.Post("/api/v1/verify-ticket", handler.VerifyTicket)               // Exact Ph6 Next.js endpoint
@@ -69,13 +92,13 @@ func NewCCTVHandler(
 	app.Get("/sso/login", handler.RenderThaIDLoginPage)              // Exact Ph6 Next.js SSO URL
 	app.Get("/login/cctv/thaid", handler.RenderThaIDLoginPage)       // Alias
 	app.Get("/sso/callback", handler.HandleThaIDCallback)            // Callback handler after ThaID approval
-	app.Get("/sso/simulate-callback", handler.SimulateThaIDCallback) // Dev / UAT Bypass Simulator
 
-	// 4. Mobile CCTV Telemetry (Optional Auth - Citizen / Guest)
-	app.Post("/api/v1/mobile/cctv/logs", handler.CreateViewLog)
-	app.Post("/mobile/cctv/logs", handler.CreateViewLog)
-	app.Post("/api/v1/cctv/logs", handler.CreateViewLog)
-	app.Post("/cctv/logs", handler.CreateViewLog)
+	// 4. Mobile CCTV Telemetry (Optional Auth - Citizen / Guest, rate-limited)
+	telemetryLimiter := middleware.NewAPIRateLimiter(cfg, 180, 240, time.Minute)
+	app.Post("/api/v1/mobile/cctv/logs", telemetryLimiter, handler.CreateViewLog)
+	app.Post("/mobile/cctv/logs", telemetryLimiter, handler.CreateViewLog)
+	app.Post("/api/v1/cctv/logs", telemetryLimiter, handler.CreateViewLog)
+	app.Post("/cctv/logs", telemetryLimiter, handler.CreateViewLog)
 }
 
 func (h *cctvHandler) checkRateLimit(key string, maxRequests int, window time.Duration) bool {
@@ -279,8 +302,11 @@ func (h *cctvHandler) RenderThaIDLoginPage(c fiber.Ctx) error {
 		url.QueryEscape(state),
 	)
 
-	// Mode "simulate" renders the dev/tester bypass page
+	// Mode "simulate" renders the dev/tester bypass page (strictly disabled in production)
 	if mode == "simulate" {
+		if h.cfg != nil && strings.EqualFold(h.cfg.AppEnv, "production") {
+			return c.Status(fiber.StatusForbidden).SendString("Simulation mode is disabled in production")
+		}
 		simURL := fmt.Sprintf("/sso/simulate-callback?callback_url=%s&partner_id=%s",
 			url.QueryEscape(callbackURL),
 			url.QueryEscape(partnerID),
@@ -389,23 +415,25 @@ func (h *cctvHandler) HandleThaIDCallback(c fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).SendString("Missing authorization code or state")
 	}
 
-	// 1. Retrieve session state from Redis
+	// 1. Retrieve session state from Redis (strictly required to prevent CSRF / open redirect)
 	stateKey := fmt.Sprintf("cctv_state:%s", state)
 	var session struct {
 		CallbackURL string `json:"callback_url"`
 		PartnerID   string `json:"partner_id"`
 	}
 
-	if h.redisClient != nil {
-		if err := h.redisClient.GetJSON(context.Background(), stateKey, &session); err != nil {
-			log.Printf("⚠️ [SSO Callback] Expired or invalid state: %s (%v)", state, err)
-		} else {
-			_ = h.redisClient.Delete(context.Background(), stateKey)
-		}
+	if h.redisClient == nil {
+		return c.Status(fiber.StatusServiceUnavailable).SendString("Session store unavailable")
 	}
 
-	if session.CallbackURL == "" {
-		session.CallbackURL = "http://localhost:3000/portal"
+	if err := h.redisClient.GetJSON(context.Background(), stateKey, &session); err != nil || session.CallbackURL == "" {
+		log.Printf("⚠️ [SSO Callback] Expired or invalid state: %s (%v)", state, err)
+		return c.Status(fiber.StatusBadRequest).SendString("Invalid or expired SSO state")
+	}
+	_ = h.redisClient.Delete(context.Background(), stateKey)
+
+	if !h.useCase.ValidateCallbackURL(session.CallbackURL) {
+		return c.Status(fiber.StatusBadRequest).SendString("Invalid callback URL in session")
 	}
 	if session.PartnerID == "" {
 		session.PartnerID = "ph6"
@@ -437,29 +465,6 @@ func (h *cctvHandler) HandleThaIDCallback(c fiber.Ctx) error {
 
 	log.Printf("✅ [SSO Callback] ThaID Login Success for User %s. Redirecting to: %s", authResp.User.ID, redirectTarget)
 	return c.Redirect().To(redirectTarget)
-}
-
-// SimulateThaIDCallback [Dev/UAT Simulator]
-// Allows developers/testers to simulate a successful ThaID QR scan without mobile devices.
-func (h *cctvHandler) SimulateThaIDCallback(c fiber.Ctx) error {
-	callbackURL := c.Query("redirect_to")
-	if callbackURL == "" {
-		callbackURL = c.Query("callback_url")
-	}
-	partnerID := c.Query("partner_id")
-
-	if callbackURL == "" || !h.useCase.ValidateCallbackURL(callbackURL) {
-		return c.Status(fiber.StatusBadRequest).SendString("Invalid or unauthorized callback URL")
-	}
-
-	// Use Somchai (ThaID verified test user in UAT DB)
-	testUserID, _ := uuid.Parse("1a5152bd-d98f-448c-865c-6f74fe47e1ea")
-	targetURL, err := h.useCase.CreateWebHandshakeTicket(testUserID, callbackURL, partnerID)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).SendString("Failed to generate simulation ticket: " + err.Error())
-	}
-
-	return c.Redirect().To(targetURL)
 }
 
 func (h *cctvHandler) GetCameras(c fiber.Ctx) error {

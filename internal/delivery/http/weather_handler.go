@@ -2,7 +2,9 @@ package http
 
 import (
 	"crypto/subtle"
+	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +12,28 @@ import (
 	"super-app-chonburi-go-mobile/internal/usecase"
 
 	"github.com/gofiber/fiber/v3"
+)
+
+var (
+	validChonburiDistricts = map[string]bool{
+		"เมืองชลบุรี": true,
+		"บางละมุง":    true,
+		"ศรีราชา":     true,
+		"พานทอง":     true,
+		"พนัสนิคม":    true,
+		"บ้านบึง":     true,
+		"สัตหีบ":      true,
+		"บ่อทอง":      true,
+		"หนองใหญ่":    true,
+		"เกาะจันทร์":   true,
+		"เกาะสีชัง":   true,
+	}
+	validOverviewPeriods = map[string]bool{
+		"daily":   true,
+		"monthly": true,
+		"yearly":  true,
+	}
+	safeDateRegex = regexp.MustCompile(`^[0-9]{4}(-[0-9]{2}(-[0-9]{2})?)?$`)
 )
 
 type WeatherHandler struct {
@@ -37,6 +61,7 @@ func NewWeatherHandler(app *fiber.App, useCase usecase.WeatherUseCase) {
 		g.Get("/map/frames", h.GetMapFrames)
 		g.Get("/map/tiles", h.GetMapTiles)
 		g.Get("/map/tiles/range", h.GetMapTilesRange)
+		g.Get("/overview", h.GetWeatherOverview)
 		g.Post("/cache/flush", h.FlushCache)
 	}
 
@@ -291,13 +316,10 @@ func (h *WeatherHandler) FlushCache(c fiber.Ctx) error {
 		adminKey = c.Get("X-Admin-Key")
 	}
 	expectedKey := os.Getenv("FAHFON_SERVICE_KEY")
-	if expectedKey == "" {
-		expectedKey = "ff_sec_service_key_Prod_7821_wQ9s8Zx2tA"
-	}
 
-	// Restrict cache flush to authorized admin key or localhost
+	// Restrict cache flush to authorized admin key or localhost (never use hardcoded fallback)
 	isLocal := c.IP() == "127.0.0.1" || c.IP() == "::1"
-	if !isLocal && (adminKey == "" || subtle.ConstantTimeCompare([]byte(adminKey), []byte(expectedKey)) != 1) {
+	if !isLocal && (expectedKey == "" || adminKey == "" || subtle.ConstantTimeCompare([]byte(adminKey), []byte(expectedKey)) != 1) {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"success": false,
 			"error":   "unauthorized: valid admin key required to flush cache",
@@ -306,13 +328,57 @@ func (h *WeatherHandler) FlushCache(c fiber.Ctx) error {
 
 	ctx := c.Context()
 	if err := h.useCase.FlushCache(ctx); err != nil {
+		log.Printf("⚠️ [WeatherHandler] FlushCache error: %v", err)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"success": false,
-			"error":   err.Error(),
+			"error":   "failed to clear weather stations cache",
 		})
 	}
 	return c.JSON(fiber.Map{
 		"success": true,
 		"message": "Weather stations cache cleared",
+	})
+}
+
+func (h *WeatherHandler) GetWeatherOverview(c fiber.Ctx) error {
+	ctx := c.Context()
+
+	// 1. Validate & Sanitize District
+	district := strings.TrimSpace(c.Query("district", "เมืองชลบุรี"))
+	if !validChonburiDistricts[district] {
+		district = "เมืองชลบุรี"
+	}
+
+	// 2. Validate & Sanitize Period
+	period := strings.ToLower(strings.TrimSpace(c.Query("period", "daily")))
+	if !validOverviewPeriods[period] {
+		period = "daily"
+	}
+
+	// 3. Validate & Sanitize Date (Prevent Cache Injection & Path Traversal)
+	defaultDate := time.Now().Format("2006-01-02")
+	if period == "monthly" {
+		defaultDate = time.Now().Format("2006-01")
+	} else if period == "yearly" {
+		defaultDate = time.Now().Format("2006")
+	}
+
+	date := strings.TrimSpace(c.Query("date", defaultDate))
+	if date == "" || len(date) > 10 || !safeDateRegex.MatchString(date) {
+		date = defaultDate
+	}
+
+	res, err := h.useCase.GetWeatherOverview(ctx, district, period, date)
+	if err != nil {
+		log.Printf("⚠️ [WeatherHandler] GetWeatherOverview error: %v", err)
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error":   "failed to retrieve weather overview",
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"data":    res,
 	})
 }

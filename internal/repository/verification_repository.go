@@ -1,10 +1,19 @@
 package repository
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
 	"time"
 
+	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
 
 	"github.com/google/uuid"
@@ -12,11 +21,83 @@ import (
 )
 
 type verificationRepository struct {
-	db *gorm.DB
+	db  *gorm.DB
+	cfg *config.Config
 }
 
-func NewVerificationRepository(db *gorm.DB) domain.VerificationRepository {
-	return &verificationRepository{db: db}
+func NewVerificationRepository(db *gorm.DB, cfgs ...*config.Config) domain.VerificationRepository {
+	var cfg *config.Config
+	if len(cfgs) > 0 {
+		cfg = cfgs[0]
+	}
+	return &verificationRepository{db: db, cfg: cfg}
+}
+
+func (r *verificationRepository) getPIDHmacSecret() string {
+	if r.cfg != nil && r.cfg.PIDHmacSecret != "" {
+		return r.cfg.PIDHmacSecret
+	}
+	if envVal := os.Getenv("PID_HMAC_SECRET"); envVal != "" {
+		return envVal
+	}
+	seed := os.Getenv("JWT_SECRET")
+	if r.cfg != nil && r.cfg.JWTSecret != "" {
+		seed = r.cfg.JWTSecret
+	}
+	if seed == "" {
+		seed = "default-fallback-secret"
+	}
+	sum := sha256.Sum256([]byte(seed + ":pid_hmac_secret"))
+	return hex.EncodeToString(sum[:])
+}
+
+func (r *verificationRepository) getPIDEncryptionKey() string {
+	if r.cfg != nil && len(r.cfg.PIDEncryptionKey) == 64 {
+		if b, err := hex.DecodeString(r.cfg.PIDEncryptionKey); err == nil && len(b) == 32 {
+			return r.cfg.PIDEncryptionKey
+		}
+	}
+	if envKey := os.Getenv("PID_ENCRYPTION_KEY"); len(envKey) == 64 {
+		if b, err := hex.DecodeString(envKey); err == nil && len(b) == 32 {
+			return envKey
+		}
+	}
+	seed := os.Getenv("JWT_SECRET")
+	if r.cfg != nil && r.cfg.JWTSecret != "" {
+		seed = r.cfg.JWTSecret
+	}
+	if seed == "" {
+		seed = "default-fallback-secret"
+	}
+	sum := sha256.Sum256([]byte(seed + ":pid_encryption_key"))
+	return hex.EncodeToString(sum[:])
+}
+
+func hmacSHA256Repo(data, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(data))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func encryptAES256GCMRepo(plaintext, keyHex string) (string, error) {
+	keyBytes, err := hex.DecodeString(keyHex)
+	if err != nil || len(keyBytes) != 32 {
+		return "", fmt.Errorf("PID_ENCRYPTION_KEY must be a 64-char hex string (32 bytes): %w", err)
+	}
+	block, err := aes.NewCipher(keyBytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to create AES cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("failed to create GCM: %w", err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", fmt.Errorf("failed to generate nonce: %w", err)
+	}
+	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
 func (r *verificationRepository) GetUserWithInfo(userID uuid.UUID) (*domain.AppUser, error) {
@@ -24,6 +105,9 @@ func (r *verificationRepository) GetUserWithInfo(userID uuid.UUID) (*domain.AppU
 	err := r.db.Preload("Information").Preload("OauthAccounts").First(&user, "id = ?", userID).Error
 	if err != nil {
 		return nil, err
+	}
+	if isUserSoftDeleted(&user) {
+		return nil, gorm.ErrRecordNotFound
 	}
 	return &user, nil
 }
@@ -38,9 +122,11 @@ func (r *verificationRepository) GetModulesForMenu() ([]domain.Module, error) {
 }
 
 func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domain.SubmitVerificationRequest) error {
-	h := sha256.New()
-	h.Write([]byte(req.IdentityNumber))
-	identityHash := hex.EncodeToString(h.Sum(nil))
+	identityHash := hmacSHA256Repo(req.IdentityNumber, r.getPIDHmacSecret())
+	encryptedIdentity, err := encryptAES256GCMRepo(req.IdentityNumber, r.getPIDEncryptionKey())
+	if err != nil {
+		return fmt.Errorf("failed to encrypt identity number: %w", err)
+	}
 
 	var currentStatus string
 	_ = r.db.Model(&domain.UserInformation{}).
@@ -58,7 +144,7 @@ func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domai
 		"id_card_type":              req.IdCardType,
 		"id_card_photo_url":         req.IdCardPhotoUrl,
 		"id_card_expiry":            req.IdCardExpiry,
-		"identity_number_encrypted": "ENC_" + req.IdentityNumber,
+		"identity_number_encrypted": encryptedIdentity,
 		"identity_number_hash":      identityHash,
 		"prefix":                    req.Prefix,
 		"name":                      req.Name,
@@ -79,7 +165,7 @@ func (r *verificationRepository) SubmitVerification(userID uuid.UUID, req *domai
 		"updated_date":              time.Now(),
 	}
 
-	err := r.db.Model(&domain.UserInformation{}).
+	err = r.db.Model(&domain.UserInformation{}).
 		Where("user_id = ?", userID).
 		Updates(updates).Error
 	if err != nil {

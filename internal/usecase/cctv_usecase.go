@@ -19,6 +19,7 @@ import (
 	"super-app-chonburi-go-mobile/config"
 	"super-app-chonburi-go-mobile/internal/domain"
 	"super-app-chonburi-go-mobile/internal/infrastructure"
+	"super-app-chonburi-go-mobile/pkg/safe"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -260,11 +261,11 @@ func (u *cctvUseCase) CreateHandshakeTicket(userID uuid.UUID, input domain.Creat
 			CreatedAt:       now,
 			UpdatedAt:       now,
 		}
-		go func(r *domain.CCTVRequest) {
-			if createErr := u.repo.CreateRequest(r); createErr != nil {
+		safe.Go(func() {
+			if createErr := u.repo.CreateRequest(cctvReq); createErr != nil {
 				log.Printf("⚠️ [CCTV Request DB Log] Failed to record CCTV request history: %v", createErr)
 			}
-		}(cctvReq)
+		})
 	}
 
 	// 2. Extract Client Metadata for KPI and Audit Logging
@@ -278,18 +279,18 @@ func (u *cctvUseCase) CreateHandshakeTicket(userID uuid.UUID, input domain.Creat
 		platform = "mobile"
 	}
 
-	// 3. KPI Log: Track module usage in module_usage_logs
+	// 3. KPI Log: Track module usage in module_usage_logs (Safe Panic Protected)
 	if u.analyticsUC != nil {
-		go func(uid uuid.UUID, clientIP, uAgent, plt string) {
+		safe.Go(func() {
 			usageDTO := &domain.RecordModuleUsageDTO{
 				ModuleCode: "cctv",
 				Action:     "HANDSHAKE_TICKET_REQUEST",
-				Platform:   plt,
+				Platform:   platform,
 			}
-			if trackErr := u.analyticsUC.TrackModuleUsage(usageDTO, &uid, clientIP, uAgent); trackErr != nil {
+			if trackErr := u.analyticsUC.TrackModuleUsage(usageDTO, &userID, ip, userAgent); trackErr != nil {
 				log.Printf("⚠️ [CCTV KPI Log] Failed to track module usage: %v", trackErr)
 			}
-		}(userID, ip, userAgent, platform)
+		})
 	}
 
 	// 4. Structured Security Audit Log

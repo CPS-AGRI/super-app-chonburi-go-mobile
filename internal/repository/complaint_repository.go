@@ -16,10 +16,19 @@ func NewComplaintRepository(db *gorm.DB) domain.ComplaintRepository {
 }
 
 func (r *complaintRepository) Create(complaint *domain.Complaint) error {
-	return r.db.Create(complaint).Error
+	return r.db.Omit("deleted_at").Create(complaint).Error
 }
 
 func (r *complaintRepository) GetByUserID(userID string, status string, search string, page int, limit int) ([]domain.Complaint, error) {
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 {
+		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
+	}
 	var complaints []domain.Complaint
 	query := r.db.Preload("Images").Preload("ModuleType").Preload("Activities.Images").Where("user_id = ?", userID)
 

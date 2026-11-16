@@ -1,0 +1,10 @@
+.git
+tmp
+*.log
+main
+server
+.env
+.env.*
+env
+uploads/
+

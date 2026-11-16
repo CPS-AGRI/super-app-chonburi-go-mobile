@@ -20,8 +20,14 @@ go.work.sum
 
 # Env files
 .env
+.env.*
 .env.local
 .env.production
+env
+
+# Uploads & Logs
+uploads/
+*.log
 
 # IDEs
 .vscode/

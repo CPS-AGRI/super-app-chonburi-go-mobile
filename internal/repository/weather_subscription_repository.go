@@ -99,14 +99,35 @@ func (r *weatherSubscriptionRepository) Delete(id uuid.UUID, userID uuid.UUID) e
 	return nil
 }
 
-// GetAlertHistory returns recent weather alerts matching the given subdistricts.
-// If subdistricts is empty, it returns the most recent alerts across Chonburi.
+// GetAlertHistory returns recent weather alerts (excluding flood alerts) matching the given subdistricts.
+// If subdistricts is empty, it returns the most recent weather alerts across Chonburi.
 func (r *weatherSubscriptionRepository) GetAlertHistory(subdistricts []string, limit int) ([]domain.WeatherAlertHistory, error) {
 	if limit <= 0 {
 		limit = 30
 	}
 	var alerts []domain.WeatherAlertHistory
-	query := r.db.Model(&domain.WeatherAlertHistory{}).Order("created_at DESC").Limit(limit)
+	query := r.db.Model(&domain.WeatherAlertHistory{}).
+		Where("alert_type != ? OR alert_type IS NULL", "flood").
+		Order("created_at DESC").
+		Limit(limit)
+	if len(subdistricts) > 0 {
+		query = query.Where("subdistrict IN ?", subdistricts)
+	}
+	err := query.Find(&alerts).Error
+	return alerts, err
+}
+
+// GetFloodAlertHistory returns recent flood/water-level alerts matching the given subdistricts.
+// If subdistricts is empty, it returns the most recent flood alerts across Chonburi.
+func (r *weatherSubscriptionRepository) GetFloodAlertHistory(subdistricts []string, limit int) ([]domain.WeatherAlertHistory, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	var alerts []domain.WeatherAlertHistory
+	query := r.db.Model(&domain.WeatherAlertHistory{}).
+		Where("alert_type = ?", "flood").
+		Order("created_at DESC").
+		Limit(limit)
 	if len(subdistricts) > 0 {
 		query = query.Where("subdistrict IN ?", subdistricts)
 	}

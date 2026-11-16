@@ -37,15 +37,27 @@ func RegisterWeatherSubscriptionRoutes(app *fiber.App, cfg *config.Config, uc do
 	h := &WeatherSubscriptionHandler{useCase: uc}
 
 	// Register on both /api/v1/mobile/weather and /api/v1/weather for client compatibility
-	registerGroup := func(g fiber.Router) {
-		g.Get("/subscriptions", h.GetSubscriptions)
-		g.Post("/subscriptions", h.AddSubscription)
-		g.Delete("/subscriptions/:id", h.RemoveSubscription)
-		g.Get("/alerts", h.GetAlerts)
+	authMiddleware := jwtutil.RequireAuth(cfg)
+
+	registerGroup := func(prefix string) {
+		app.Get(prefix+"/subscriptions", authMiddleware, h.GetSubscriptions)
+		app.Post(prefix+"/subscriptions", authMiddleware, h.AddSubscription)
+		app.Delete(prefix+"/subscriptions/:id", authMiddleware, h.RemoveSubscription)
+		app.Get(prefix+"/alerts", authMiddleware, h.GetAlerts)
 	}
 
-	registerGroup(app.Group("/api/v1/mobile/weather", jwtutil.RequireAuth(cfg)))
-	registerGroup(app.Group("/api/v1/weather", jwtutil.RequireAuth(cfg)))
+	registerGroup("/api/v1/mobile/weather")
+	registerGroup("/api/v1/weather")
+
+	// Flood/Water-Level alert history routes
+	registerFloodGroup := func(prefix string) {
+		app.Get(prefix+"/alerts", authMiddleware, h.GetFloodAlerts)
+		app.Get(prefix+"/alerts/history", authMiddleware, h.GetFloodAlerts)
+	}
+	registerFloodGroup("/api/v1/mobile/flood")
+	registerFloodGroup("/api/v1/flood")
+	registerFloodGroup("/api/v1/mobile/water-level")
+	registerFloodGroup("/api/v1/water-level")
 
 	// Static data — no auth required, cached at client
 	app.Get("/api/v1/mobile/weather/locations", h.GetLocations)
@@ -152,6 +164,30 @@ func (h *WeatherSubscriptionHandler) GetAlerts(c fiber.Ctx) error {
 		limit = 30
 	}
 	alerts, err := h.useCase.GetAlertHistory(userID, limit)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"data": alerts})
+}
+
+// GetFloodAlerts godoc
+// @Summary     Get recent flood and water level alerts matching user's subscribed areas
+// @Tags        Flood Alerts
+// @Security    BearerAuth
+// @Produce     json
+// @Success     200 {object} fiber.Map
+// @Router      /api/v1/mobile/flood/alerts [get]
+func (h *WeatherSubscriptionHandler) GetFloodAlerts(c fiber.Ctx) error {
+	userID, err := extractUserUUID(c)
+	if err != nil {
+		return fiber.ErrUnauthorized
+	}
+
+	limit, _ := strconv.Atoi(c.Query("limit", "30"))
+	if limit <= 0 {
+		limit = 30
+	}
+	alerts, err := h.useCase.GetFloodAlertHistory(userID, limit)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}

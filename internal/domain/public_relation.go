@@ -1,9 +1,16 @@
 package domain
 
 import (
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
+)
+
+var (
+	ErrCommentNotFound        = errors.New("comment not found")
+	ErrCannotReportOwnComment = errors.New("cannot report your own comment")
+	ErrInvalidCommentInput    = errors.New("invalid comment input")
 )
 
 type PublicRelation struct {
@@ -131,9 +138,11 @@ type PublicRelationMobileRepository interface {
 	ToggleLike(prId string, userId string) (bool, error)
 	CreateComment(comment *PublicRelationComment) error
 	GetComments(prId string) ([]PublicRelationComment, error)
+	GetCommentByID(commentId string) (*PublicRelationComment, error)
+	GetNewsModerationTarget(prId string) (title string, adminID uuid.UUID, departmentID string, err error)
 	DeleteComment(commentId string, userId string) error
-	ReportComment(commentId string) error
-	HideComment(commentId string) error
+	ReportComment(commentId string, reporterUserID string) (bool, error)
+	HideComment(commentId string, userId string) error
 	GetActiveWelcomeScreen() (*MunicipalityWelcomeScreen, error)
 }
 
@@ -144,8 +153,8 @@ type PublicRelationMobileUseCase interface {
 	AddComment(moduleId string, prId string, userId string, commentText string) (*PublicRelationComment, error)
 	GetComments(prId string) ([]PublicRelationComment, error)
 	DeleteComment(commentId string, userId string) error
-	ReportComment(commentId string) error
-	HideComment(commentId string) error
+	ReportComment(commentId string, reporterUserID string) error
+	HideComment(commentId string, userId string) error
 	GetWelcomeScreen() (*MunicipalityWelcomeScreen, error)
 	RecordNewsView(prId string, userId string, sessionId string) error
 }

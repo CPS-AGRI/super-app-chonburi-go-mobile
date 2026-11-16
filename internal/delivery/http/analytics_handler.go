@@ -1,11 +1,14 @@
 package http
 
 import (
+	"log"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/google/uuid"
 	"super-app-chonburi-go-mobile/config"
+	"super-app-chonburi-go-mobile/internal/delivery/http/middleware"
 	"super-app-chonburi-go-mobile/internal/domain"
 	"super-app-chonburi-go-mobile/pkg/jwtutil"
 )
@@ -17,10 +20,12 @@ type analyticsHandler struct {
 
 func NewAnalyticsHandler(app *fiber.App, uc domain.AnalyticsUseCase, cfg *config.Config) {
 	handler := &analyticsHandler{uc: uc, cfg: cfg}
+	telemetryLimiter := middleware.NewAPIRateLimiter(cfg, 180, 240, time.Minute)
 
 	// Register on both base path and api/v1 for maximum client compatibility
-	app.Post("/analytics/module-usage", handler.RecordModuleUsage)
-	app.Post("/api/v1/analytics/module-usage", handler.RecordModuleUsage)
+	app.Post("/analytics/module-usage", telemetryLimiter, handler.RecordModuleUsage)
+	app.Post("/api/v1/analytics/module-usage", telemetryLimiter, handler.RecordModuleUsage)
+	app.Post("/api/v1/mobile/analytics/module-usage", telemetryLimiter, handler.RecordModuleUsage)
 }
 
 func (h *analyticsHandler) RecordModuleUsage(c fiber.Ctx) error {
@@ -49,7 +54,8 @@ func (h *analyticsHandler) RecordModuleUsage(c fiber.Ctx) error {
 	userAgent := c.Get("User-Agent")
 
 	if err := h.uc.TrackModuleUsage(&req, userUUID, ip, userAgent); err != nil {
-		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		log.Printf("⚠️ [AnalyticsHandler] TrackModuleUsage failed: %v", err)
+		return c.Status(500).JSON(fiber.Map{"error": "failed to track module usage"})
 	}
 
 	return c.JSON(fiber.Map{

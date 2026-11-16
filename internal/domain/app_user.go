@@ -92,6 +92,10 @@ type UserInformation struct {
 	IsOnlineTaxPaymentReceipt bool   `gorm:"not null;default:false;column:is_online_tax_payment_receipt" json:"is_online_tax_payment_receipt"`
 	LogoUrl                   string `gorm:"type:text;not null;default:'';column:logo_url" json:"logo_url"`
 
+	PopulationType string `gorm:"type:varchar(20);not null;default:'real';column:population_type" json:"population_type"`
+	VerifiedByType string `gorm:"type:varchar(20);not null;default:'admin';column:verified_by_type" json:"verified_by_type"`
+	CardAddress    string `gorm:"type:text;not null;default:'';column:card_address" json:"card_address"`
+
 	CreatedBy   string    `gorm:"type:text;not null;default:'';column:created_by" json:"created_by"`
 	CreatedDate time.Time `gorm:"type:timestamptz;not null;default:CURRENT_TIMESTAMP;column:created_date" json:"created_date"`
 	UpdatedBy   string    `gorm:"type:text;not null;default:'';column:updated_by" json:"updated_by"`
@@ -135,6 +139,7 @@ type LinkSocialRequest struct {
 type AuthRepository interface {
 	GetByID(id uuid.UUID) (*AppUser, error)
 	GetByProviderID(provider, providerID string) (*AppUser, error)
+	GetByOAuthAccountID(oauthID uuid.UUID) (*AppUser, error)
 	GetByEmail(email string) (*AppUser, error)
 	GetByPhoneNumber(phoneNumber string) (*AppUser, error)
 	Create(user *AppUser) error
@@ -143,6 +148,7 @@ type AuthRepository interface {
 	UpdateOauthAccount(oauth *UserOauthAccount) error
 	DeleteOauthAccount(id uuid.UUID) error
 	Delete(user *AppUser) error
+	SoftDeleteUser(userID uuid.UUID) error
 	GetSocialLinks(userID uuid.UUID) (*SocialAccountsResponse, error)
 	UnlinkSocial(userID uuid.UUID, provider string) error
 	LinkSocialAccount(userID uuid.UUID, account *UserOauthAccount) error
@@ -240,11 +246,42 @@ type PinLoginRequest struct {
 	Pin         string `json:"pin"`
 }
 
+type UpdateProfileRequest struct {
+	Prefix          *string `json:"prefix"`
+	Name            *string `json:"name"`
+	FirstName       *string `json:"first_name"`
+	LastName        *string `json:"last_name"`
+	Email           *string `json:"email"`
+	Phone           *string `json:"phone"`
+	PhoneNumber     *string `json:"phone_number"`
+	Birthday        *string `json:"birthday"`
+	HouseNumber     *string `json:"house_number"`
+	HouseNo         *string `json:"house_no"`
+	VillageNumber   *string `json:"village_number"`
+	VillageNo       *string `json:"village_no"`
+	Alley           *string `json:"alley"`
+	Soi             *string `json:"soi"`
+	Intersection    *string `json:"intersection"`
+	Road            *string `json:"road"`
+	Subdistrict     *string `json:"subdistrict"`
+	SubDistrict     *string `json:"sub_district"`
+	District        *string `json:"district"`
+	Province        *string `json:"province"`
+	PostalCode      *int    `json:"-"`
+	BuildingName    *string `json:"building_name"`
+	Building        *string `json:"building"`
+	RoomNumber      *string `json:"room_number"`
+	RoomNo          *string `json:"room_no"`
+	CardAddress     *string `json:"card_address"`
+	ImageProfileURL *string `json:"image_profile_url"`
+}
+
 type AuthUseCase interface {
 	LoginWithGoogle(tokenOrCode string, redirectURI ...string) (*AuthResponse, error)
 	LoginWithFacebook(accessToken string) (*AuthResponse, error)
 	LoginWithFacebookLimited(authToken string) (*AuthResponse, error)
 	LoginWithLine(code string, redirectURI string) (*AuthResponse, error)
+	LoginWithApple(idToken string, fullName string) (*AuthResponse, error)
 	LoginWithThaiID(code string, redirectURI string) (*AuthResponse, error)
 	BindThaiID(userID string, code string, redirectURI string) (*AuthResponse, error)
 	ConfirmThaiIDMigration(userID string, migrationToken string) (*AuthResponse, error)
@@ -263,6 +300,10 @@ type AuthUseCase interface {
 	UnlinkSocial(userID uuid.UUID, provider string) error
 	LinkSocial(userID uuid.UUID, req LinkSocialRequest) error
 	UpdateProfileImage(userID uuid.UUID, imageURL string) error
+	UpdateProfile(userID uuid.UUID, req UpdateProfileRequest) (*AppUser, error)
+	ChangePin(userID uuid.UUID, oldPin, newPin string) error
+	ResetPin(tempToken, phoneNumber, newPin string) (*AuthResponse, error)
+	DeleteAccount(userID uuid.UUID) error
 }
 
 type AuthResponse struct {

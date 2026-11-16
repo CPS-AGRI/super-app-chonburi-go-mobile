@@ -34,7 +34,6 @@ type Complaint struct {
 	UpdatedDate  time.Time  `gorm:"not null;type:timestamptz;column:updated_date" json:"updated_at"`
 	CreatedBy    string     `gorm:"not null;column:created_by" json:"created_by"`
 	UpdatedBy    string     `gorm:"not null;column:updated_by" json:"updated_by"`
-	DeletedAt    *time.Time `gorm:"column:deleted_at" json:"deleted_at,omitempty"`
 	DepartmentId *string    `gorm:"type:uuid;index;column:department_id" json:"department_id"`
 	AssigneeId   *string    `gorm:"type:uuid;index;column:assignee_id" json:"assignee_id"`
 	IsDisputed   bool       `gorm:"not null;default:false;column:is_disputed;index" json:"is_disputed"`
