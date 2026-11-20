@@ -176,10 +176,16 @@ func (r *authRepository) Update(user *domain.AppUser) error {
 }
 
 func (r *authRepository) CreateOauthAccount(oauth *domain.UserOauthAccount) error {
+	if strings.TrimSpace(oauth.RawData) == "" {
+		oauth.RawData = "{}"
+	}
 	return r.db.Create(oauth).Error
 }
 
 func (r *authRepository) UpdateOauthAccount(oauth *domain.UserOauthAccount) error {
+	if strings.TrimSpace(oauth.RawData) == "" {
+		oauth.RawData = "{}"
+	}
 	return r.db.Save(oauth).Error
 }
 
@@ -461,6 +467,9 @@ func (r *authRepository) UnlinkSocial(userID uuid.UUID, provider string) error {
 
 func (r *authRepository) LinkSocialAccount(userID uuid.UUID, account *domain.UserOauthAccount) error {
 	account.UserId = userID
+	if strings.TrimSpace(account.RawData) == "" {
+		account.RawData = "{}"
+	}
 	// Check if already linked to another user
 	var existing domain.UserOauthAccount
 	if err := r.db.Where("provider = ? AND provider_id = ?", account.Provider, account.ProviderId).First(&existing).Error; err == nil {

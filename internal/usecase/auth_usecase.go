@@ -2423,8 +2423,10 @@ func (u *authUseCase) BindPhone(provider, idToken, phoneNumber, otp, ref, pin st
 		}
 	}
 	if tempUser == nil {
-		if parsedOAuthID, parseErr := uuid.Parse(idToken); parseErr == nil {
-			if candidate, err := u.repo.GetByOAuthAccountID(parsedOAuthID); err == nil && candidate != nil && isUnlinkedOAuthPhone(candidate.PhoneNumber) {
+		if parsedID, parseErr := uuid.Parse(idToken); parseErr == nil {
+			if candidate, err := u.repo.GetByOAuthAccountID(parsedID); err == nil && candidate != nil && isUnlinkedOAuthPhone(candidate.PhoneNumber) {
+				tempUser = candidate
+			} else if candidate, err := u.repo.GetByID(parsedID); err == nil && candidate != nil && isUnlinkedOAuthPhone(candidate.PhoneNumber) {
 				tempUser = candidate
 			}
 		}
@@ -3012,7 +3014,40 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 		return nil
 
 	case "facebook":
-		fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", url.QueryEscape(req.AccessToken))
+		fbToken := strings.TrimSpace(req.AccessToken)
+		if fbToken == "" {
+			fbToken = strings.TrimSpace(req.IDToken)
+		}
+		if fbToken == "" {
+			return errors.New("access_token or id_token is required for facebook")
+		}
+
+		fbAppID := ""
+		if u.config != nil {
+			fbAppID = u.config.FacebookAppID
+		}
+
+		// 1. Check iOS Limited Login JWT Token first
+		if claims, err := verifyFacebookLimitedToken(fbToken, fbAppID); err == nil && claims.Sub != "" {
+			rawBytes, _ := json.Marshal(claims)
+			account := &domain.UserOauthAccount{
+				Provider:    "Facebook",
+				ProviderId:  claims.Sub,
+				Email:       claims.Email,
+				DisplayName: claims.Name,
+				AvatarUrl:   claims.Picture,
+				RawData:     string(rawBytes),
+				CreatedAt:   time.Now(),
+			}
+			if err := u.repo.LinkSocialAccount(userID, account); err != nil {
+				return err
+			}
+			u.syncProfileFromSocial(userID, account)
+			return nil
+		}
+
+		// 2. Fallback to Standard Graph API for Android/Web Access Token
+		fbURL := fmt.Sprintf("https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=%s", url.QueryEscape(fbToken))
 		fbReq, err := http.NewRequestWithContext(context.Background(), http.MethodGet, fbURL, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create facebook request: %w", err)
@@ -3142,11 +3177,13 @@ func (u *authUseCase) LinkSocial(userID uuid.UUID, req domain.LinkSocialRequest)
 			return fmt.Errorf("invalid apple id token: %w", err)
 		}
 
+		rawBytes, _ := json.Marshal(claims)
 		account := &domain.UserOauthAccount{
 			Provider:    "Apple",
 			ProviderId:  claims.Sub,
 			Email:       claims.Email,
 			DisplayName: "Apple User",
+			RawData:     string(rawBytes),
 			CreatedAt:   time.Now(),
 		}
 		if err := u.repo.LinkSocialAccount(userID, account); err != nil {
